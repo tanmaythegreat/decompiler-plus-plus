@@ -1,0 +1,6 @@
+[package]
+name = "decompiler-plus-plus"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
