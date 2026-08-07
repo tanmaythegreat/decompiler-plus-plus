@@ -1,0 +1,5 @@
+[package]
+name = "ir-pcode"
+version.workspace = true
+edition.workspace = true
+description = "Core P-code-inspired intermediate representation: Varnode and Instruction types."

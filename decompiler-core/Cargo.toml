@@ -1,0 +1,8 @@
+[package]
+name = "decompiler-core"
+version.workspace = true
+edition.workspace = true
+description = "Central hub crate: shared Function/BasicBlock/Variable types and the Disassembler/Lifter traits every arch-* crate implements."
+
+[dependencies]
+ir-pcode = { path = "../ir-pcode" }

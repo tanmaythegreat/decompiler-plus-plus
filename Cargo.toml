@@ -1,6 +1,15 @@
-[package]
-name = "decompiler-plus-plus"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = [
+    "decompiler-core",
+    "ir-pcode",
+    "arch-x86",
+    "cli",
+]
 
-[dependencies]
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+opt-level = 0

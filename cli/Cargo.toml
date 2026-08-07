@@ -1,0 +1,14 @@
+[package]
+name = "decompiler-cli"
+version.workspace = true
+edition.workspace = true
+description = "Phase 1 deliverable: a command-line tool that disassembles and lifts x86 bytes into the ir-pcode IR."
+
+[[bin]]
+name = "decompiler-cli"
+path = "src/main.rs"
+
+[dependencies]
+decompiler-core = { path = "../decompiler-core" }
+ir-pcode = { path = "../ir-pcode" }
+arch-x86 = { path = "../arch-x86" }

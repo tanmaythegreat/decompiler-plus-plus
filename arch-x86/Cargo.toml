@@ -1,0 +1,9 @@
+[package]
+name = "arch-x86"
+version.workspace = true
+edition.workspace = true
+description = "x86 architecture backend: decodes a representative instruction subset and lifts it to the ir-pcode IR. Implements decompiler-core's Disassembler and Lifter traits."
+
+[dependencies]
+decompiler-core = { path = "../decompiler-core" }
+ir-pcode = { path = "../ir-pcode" }
