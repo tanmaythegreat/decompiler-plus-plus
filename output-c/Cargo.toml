@@ -1,0 +1,10 @@
+[package]
+name = "output-c"
+version.workspace = true
+edition.workspace = true
+description = "Translates the simplified IR into human-readable C-like pseudocode. Phase 2: a rudimentary, goto-based generator for linear/branchy (not-yet-structured) code; Phase 4 adds real if/while reconstruction."
+
+[dependencies]
+decompiler-core = { path = "../decompiler-core" }
+ir-pcode = { path = "../ir-pcode" }
+analysis-passes = { path = "../analysis-passes" }

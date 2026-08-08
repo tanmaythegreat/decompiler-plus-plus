@@ -1,0 +1,9 @@
+[package]
+name = "analysis-passes"
+version.workspace = true
+edition.workspace = true
+description = "Analytical transformations applied to the IR: CFG construction, the generic dataflow (monotone framework) engine, and concrete passes like constant propagation built on top of it."
+
+[dependencies]
+decompiler-core = { path = "../decompiler-core" }
+ir-pcode = { path = "../ir-pcode" }
