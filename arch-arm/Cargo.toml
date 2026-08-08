@@ -1,0 +1,9 @@
+[package]
+name = "arch-arm"
+version.workspace = true
+edition.workspace = true
+description = "ARM architecture disassembler and lifter for Phase 5"
+
+[dependencies]
+decompiler-core = { path = "../decompiler-core" }
+ir-pcode = { path = "../ir-pcode" }
