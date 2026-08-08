@@ -206,6 +206,44 @@ fn cond_of(m: Mnemonic) -> Option<CondCode> {
     })
 }
 
+/// Mnemonic -> the Intel intrinsic that spells the same operation. Only the
+/// integer ops gcc's auto-vectoriser actually emits are listed; anything
+/// else keeps falling through to `__asm__`, which is honest.
+fn packed_intrinsic(m: Mnemonic) -> Option<&'static str> {
+    Some(match m {
+        Mnemonic::Paddb => "_mm_add_epi8",
+        Mnemonic::Paddw => "_mm_add_epi16",
+        Mnemonic::Paddd => "_mm_add_epi32",
+        Mnemonic::Paddq => "_mm_add_epi64",
+        Mnemonic::Psubb => "_mm_sub_epi8",
+        Mnemonic::Psubw => "_mm_sub_epi16",
+        Mnemonic::Psubd => "_mm_sub_epi32",
+        Mnemonic::Psubq => "_mm_sub_epi64",
+        Mnemonic::Pmulld => "_mm_mullo_epi32",
+        Mnemonic::Pmullw => "_mm_mullo_epi16",
+        Mnemonic::Pand => "_mm_and_si128",
+        Mnemonic::Por => "_mm_or_si128",
+        Mnemonic::Pcmpgtb => "_mm_cmpgt_epi8",
+        Mnemonic::Pcmpgtw => "_mm_cmpgt_epi16",
+        Mnemonic::Pcmpgtd => "_mm_cmpgt_epi32",
+        Mnemonic::Pcmpeqb => "_mm_cmpeq_epi8",
+        Mnemonic::Pcmpeqd => "_mm_cmpeq_epi32",
+        Mnemonic::Punpckldq => "_mm_unpacklo_epi32",
+        Mnemonic::Punpckhdq => "_mm_unpackhi_epi32",
+        Mnemonic::Punpcklqdq => "_mm_unpacklo_epi64",
+        Mnemonic::Punpckhqdq => "_mm_unpackhi_epi64",
+        Mnemonic::Pshufd => "_mm_shuffle_epi32",
+        Mnemonic::Pslld => "_mm_slli_epi32",
+        Mnemonic::Psrld => "_mm_srli_epi32",
+        Mnemonic::Psllq => "_mm_slli_epi64",
+        Mnemonic::Psrlq => "_mm_srli_epi64",
+        Mnemonic::Psrldq => "_mm_bsrli_si128",
+        Mnemonic::Pslldq => "_mm_bslli_si128",
+        Mnemonic::Movdqa | Mnemonic::Movdqu => "_mm_load_si128",
+        _ => return None,
+    })
+}
+
 pub fn sanitize_name(n: &str) -> String {
     let s: String = n
         .chars()
@@ -372,6 +410,13 @@ pub fn lift(insn: &Instruction, fmt_out: &mut String, ctx: &LiftCtx) -> LiftedIn
                     signed: false,
                     rip_abs: None,
                 }),
+            });
+            // `leave` is `mov rsp, rbp` followed by `pop rbp`, and the pop
+            // includes the stack adjustment. Without it the return address
+            // is read from the wrong slot.
+            stmts.push(Stmt::Assign {
+                dst: rsp(),
+                src: Expr::bin(BinOp::Add, Expr::Reg(RegRef::new("rsp", 8)), Expr::Const(8)),
             });
         }
 
@@ -655,6 +700,24 @@ pub fn lift(insn: &Instruction, fmt_out: &mut String, ctx: &LiftCtx) -> LiftedIn
             let src =
                 if dst == rhs { Expr::Const(0) } else { Expr::bin(BinOp::Xor, dst.clone(), rhs) };
             stmts.push(Stmt::Assign { dst, src });
+        }
+
+        // Packed SSE. The element type is in the mnemonic, so these lift to
+        // named intrinsic calls rather than opaque assembly text: an
+        // `xmm0 = _mm_add_epi64(xmm0, xmm4)` still participates in copy
+        // propagation and dead-code elimination, and it tells the reader
+        // what the vector loop is accumulating.
+        m if packed_intrinsic(m).is_some() => {
+            let name = packed_intrinsic(m).unwrap();
+            let mut args: Vec<Expr> = Vec::new();
+            for i in 0..insn.op_count() {
+                args.push(operand(insn, i as u32));
+            }
+            let dst = args[0].clone();
+            stmts.push(Stmt::Assign {
+                dst,
+                src: Expr::Call { name: name.to_string(), args, indirect: None },
+            });
         }
 
         _ => {

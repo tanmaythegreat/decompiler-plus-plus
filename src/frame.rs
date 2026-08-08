@@ -29,6 +29,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub struct GlobalMap {
     pub names: HashMap<u64, String>,
     pub strings: HashMap<u64, String>,
+    /// code addresses -> function name, so a function passed *as a value*
+    /// (a callback, or `main` handed to `__libc_start_main`) reads as its
+    /// name instead of a bare integer
+    pub funcs: HashMap<u64, String>,
 }
 
 impl GlobalMap {

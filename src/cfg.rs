@@ -36,7 +36,9 @@ pub struct Block {
 
 /// Structured output tree.
 pub enum CNode {
-    Stmts(Vec<Stmt>),
+    /// statements paired with the address of the instruction that produced
+    /// them, so a viewer can map a line of C back to the machine code
+    Stmts(Vec<(u64, Stmt)>),
     If { cond: Expr, then_: Vec<CNode>, else_: Vec<CNode> },
     While { cond: Expr, body: Vec<CNode> },
     DoWhile { body: Vec<CNode>, cond: Expr },
@@ -484,14 +486,15 @@ impl<'a> Structurer<'a> {
         out
     }
 
-    fn block_stmts(&self, b: usize) -> Vec<Stmt> {
+    fn block_stmts(&self, b: usize) -> Vec<(u64, Stmt)> {
         let mut out = Vec::new();
         for &ix in &self.cfg.blocks[b].instrs {
+            let addr = self.instrs[ix].addr;
             for st in &self.instrs[ix].stmts {
                 match st {
                     Stmt::Nop | Stmt::If { .. } | Stmt::Goto(_) => {}
                     Stmt::Assign { dst, .. } if is_frame_reg(dst) => {}
-                    other => out.push(other.clone()),
+                    other => out.push((addr, other.clone())),
                 }
             }
         }

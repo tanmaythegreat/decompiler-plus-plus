@@ -636,6 +636,7 @@ pub enum Stmt {
 }
 
 /// One lifted machine instruction.
+#[derive(Clone)]
 pub struct LiftedInsn {
     pub addr: u64,
     pub len: u32,

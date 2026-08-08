@@ -17,6 +17,12 @@ pub struct Emitter<'a> {
     /// if/else) has to become a real local, or the output names something
     /// that was never declared and cannot compile.
     pub reg_width: std::collections::HashMap<String, u8>,
+    /// render without the width-conversion casts. They are real -- the
+    /// machine does perform them -- but they bury the logic, so a reader
+    /// wants to be able to switch them off.
+    pub no_cast: bool,
+    /// one entry per emitted line: the instruction address it came from
+    pub trace: std::cell::RefCell<Vec<Option<u64>>>,
 }
 
 fn reg_name_at(r: &RegRef, width: u8) -> String {
@@ -124,6 +130,7 @@ impl<'a> Emitter<'a> {
             Expr::Un { op, e } => {
                 self.paren(format!("{}{}", op.sym(), self.expr_prec(e, 12)), 12, outer)
             }
+            Expr::Cast { ty: _, e } if self.no_cast => self.expr_prec(e, outer),
             Expr::Cast { ty, e } => self.paren(
                 format!("({}){}", ty.cast_name(self.st), self.expr_prec(e, 12)),
                 12,
@@ -164,7 +171,18 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    pub fn stmt(&self, s: &Stmt, pad: &str, out: &mut String) {
+    /// Append text and record which instruction each resulting line came
+    /// from, so the viewer can highlight the matching disassembly.
+    fn emit(&self, out: &mut String, text: String, addr: Option<u64>) {
+        let lines = text.matches('\n').count();
+        out.push_str(&text);
+        let mut t = self.trace.borrow_mut();
+        for _ in 0..lines {
+            t.push(addr);
+        }
+    }
+
+    pub fn stmt(&self, s: &Stmt, addr: Option<u64>, pad: &str, out: &mut String) {
         match s {
             Stmt::Nop => {}
             Stmt::Assign { dst, src } => {
@@ -174,36 +192,36 @@ impl<'a> Emitter<'a> {
                     if **l == *dst {
                         if matches!(op, BinOp::Add | BinOp::Sub) && r.as_const() == Some(1) {
                             let s = if *op == BinOp::Add { "++" } else { "--" };
-                            out.push_str(&format!("{}{}{};\n", pad, self.expr(dst), s));
+                            self.emit(out, format!("{}{}{};\n", pad, self.expr(dst), s), addr);
                             return;
                         }
                         if !op.is_cmp() {
-                            out.push_str(&format!(
+                            self.emit(out, format!(
                                 "{}{} {}= {};\n",
                                 pad,
                                 self.expr(dst),
                                 op.sym(),
                                 self.expr_prec(r, 0)
-                            ));
+                            ), addr);
                             return;
                         }
                     }
                 }
-                out.push_str(&format!("{}{} = {};\n", pad, self.expr(dst), self.expr(src)));
+                self.emit(out, format!("{}{} = {};\n", pad, self.expr(dst), self.expr(src)), addr);
             }
-            Stmt::Do(e) => out.push_str(&format!("{}{};\n", pad, self.expr(e))),
-            Stmt::Return(None) => out.push_str(&format!("{}return;\n", pad)),
+            Stmt::Do(e) => self.emit(out, format!("{}{};\n", pad, self.expr(e)), addr),
+            Stmt::Return(None) => self.emit(out, format!("{}return;\n", pad), addr),
             Stmt::Return(Some(e)) => {
-                out.push_str(&format!("{}return {};\n", pad, self.expr(e)))
+                self.emit(out, format!("{}return {};\n", pad, self.expr(e)), addr)
             }
-            Stmt::If { cond, target } => out.push_str(&format!(
+            Stmt::If { cond, target } => self.emit(out, format!(
                 "{}if ({}) goto L{:x};\n",
                 pad,
                 self.expr(cond),
                 target
-            )),
-            Stmt::Goto(t) => out.push_str(&format!("{}goto L{:x};\n", pad, t)),
-            Stmt::Asm(t) => out.push_str(&format!("{}__asm__(\"{}\");\n", pad, t.replace('"', "'"))),
+            ), addr),
+            Stmt::Goto(t) => self.emit(out, format!("{}goto L{:x};\n", pad, t), addr),
+            Stmt::Asm(t) => self.emit(out, format!("{}__asm__(\"{}\");\n", pad, t.replace('"', "'")), addr),
         }
     }
 
@@ -219,42 +237,42 @@ impl<'a> Emitter<'a> {
             match n {
                 CNode::Stmts(ss) => {
                     for s in ss {
-                        self.stmt(s, &pad, out);
+                        self.stmt(&s.1, Some(s.0), &pad, out);
                     }
                 }
                 CNode::Label(a) => {
                     if labels.contains(a) {
-                        out.push_str(&format!("{}L{:x}:\n", "    ".repeat(indent.saturating_sub(1)), a));
+                        self.emit(out, format!("{}L{:x}:\n", "    ".repeat(indent.saturating_sub(1)), a), Some(*a));
                     }
                 }
-                CNode::Goto(a) => out.push_str(&format!("{}goto L{:x};\n", pad, a)),
-                CNode::Break => out.push_str(&format!("{}break;\n", pad)),
-                CNode::Continue => out.push_str(&format!("{}continue;\n", pad)),
+                CNode::Goto(a) => self.emit(out, format!("{}goto L{:x};\n", pad, a), None),
+                CNode::Break => self.emit(out, format!("{}break;\n", pad), None),
+                CNode::Continue => self.emit(out, format!("{}continue;\n", pad), None),
                 CNode::If { cond, then_, else_ } => {
-                    out.push_str(&format!("{}if ({}) {{\n", pad, self.expr(cond)));
+                    self.emit(out, format!("{}if ({}) {{\n", pad, self.expr(cond)), None);
                     self.nodes(then_, indent + 1, labels, out);
                     if else_.is_empty() {
-                        out.push_str(&format!("{}}}\n", pad));
+                        self.emit(out, format!("{}}}\n", pad), None);
                     } else {
-                        out.push_str(&format!("{}}} else {{\n", pad));
+                        self.emit(out, format!("{}}} else {{\n", pad), None);
                         self.nodes(else_, indent + 1, labels, out);
-                        out.push_str(&format!("{}}}\n", pad));
+                        self.emit(out, format!("{}}}\n", pad), None);
                     }
                 }
                 CNode::While { cond, body } => {
-                    out.push_str(&format!("{}while ({}) {{\n", pad, self.expr(cond)));
+                    self.emit(out, format!("{}while ({}) {{\n", pad, self.expr(cond)), None);
                     self.nodes(body, indent + 1, labels, out);
-                    out.push_str(&format!("{}}}\n", pad));
+                    self.emit(out, format!("{}}}\n", pad), None);
                 }
                 CNode::DoWhile { body, cond } => {
-                    out.push_str(&format!("{}do {{\n", pad));
+                    self.emit(out, format!("{}do {{\n", pad), None);
                     self.nodes(body, indent + 1, labels, out);
-                    out.push_str(&format!("{}}} while ({});\n", pad, self.expr(cond)));
+                    self.emit(out, format!("{}}} while ({});\n", pad, self.expr(cond)), None);
                 }
                 CNode::Forever { body } => {
-                    out.push_str(&format!("{}for (;;) {{\n", pad));
+                    self.emit(out, format!("{}for (;;) {{\n", pad), None);
                     self.nodes(body, indent + 1, labels, out);
-                    out.push_str(&format!("{}}}\n", pad));
+                    self.emit(out, format!("{}}}\n", pad), None);
                 }
             }
         }
@@ -268,10 +286,11 @@ impl<'a> Emitter<'a> {
             if !used.contains(&id) && !v.addr_taken {
                 continue;
             }
+            let decl = v.ty.declare(&v.name, self.st);
             out.push_str(&format!(
                 "    {};{}// [rbp{}{:#x}]\n",
-                v.ty.declare(&v.name, self.st),
-                " ".repeat(28usize.saturating_sub(v.ty.declare(&v.name, self.st).len())),
+                decl,
+                " ".repeat(28usize.saturating_sub(decl.len())),
                 if v.off + 8 < 0 { "-" } else { "+" },
                 (v.off + 8).abs(),
             ));
@@ -321,7 +340,7 @@ pub fn used_regs(ns: &[CNode], out: &mut std::collections::HashMap<String, u8>) 
         match n {
             CNode::Stmts(ss) => {
                 for s in ss {
-                    match s {
+                    match &s.1 {
                         Stmt::Assign { dst, src } => {
                             from_expr(dst, out);
                             from_expr(src, out);
@@ -365,7 +384,7 @@ pub fn used_vars(ns: &[CNode], out: &mut std::collections::HashSet<VarId>) {
         match n {
             CNode::Stmts(ss) => {
                 for s in ss {
-                    match s {
+                    match &s.1 {
                         Stmt::Assign { dst, src } => {
                             from_expr(dst, out);
                             from_expr(src, out);

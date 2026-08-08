@@ -13,8 +13,7 @@ int main(void)
 
     rax = __printf_chk(2, "abs=%d clamp=%d sum=%ld\n", 7, 10, 15);
     if (malloc(32) != 0) {
-        __asm__("movdqa xmm0,[rel 402030h]");
-        *(int *)rax = xmm0;
+        *(int *)rax = _mm_load_si128(xmm0, *(int *)0x402030);
         rax = 114;
         *(unsigned short *)(rax + 16) = 114;
         rax = puts(rax);
@@ -35,7 +34,7 @@ void _start(void)
 
     sa1 = rax;
     v1 = rsp;
-    __libc_start_main(0x4010b0, v1, rsp, 0, 0, rdx);
+    __libc_start_main(main, v1, rsp, 0, 0, rdx);
     __asm__("hlt");
 }
 

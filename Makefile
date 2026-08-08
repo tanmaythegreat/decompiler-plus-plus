@@ -9,7 +9,29 @@
 #   make show-O2     # build+decompile+print just the -O2 variant
 #   make clean
 
-CC          := gcc
+# Linux/ELF toolchain shim
+# On Linux, gcc already emits ELF, so just use it directly.
+# On macOS (or anywhere else), "gcc" is usually a clang shim that silently
+# ignores ELF-only flags like -no-pie and emits Mach-O instead, which
+# mini_decompiler can't parse. In that case, run the compiler and strip
+# inside a throwaway Linux container so the output is always ELF.
+UNAME_S := $(shell uname -s)
+
+DOCKER_IMAGE := gcc:latest
+# Mounts the current directory read/write at /src inside the container,
+# and runs as your own uid/gid so output files aren't root-owned.
+DOCKER_RUN := docker run --rm -v "$(CURDIR)":/src -w /src \
+              -u $(shell id -u):$(shell id -g) $(DOCKER_IMAGE)
+
+ifeq ($(UNAME_S),Linux)
+CC    := gcc
+STRIP := strip
+else
+CC    := $(DOCKER_RUN) gcc
+STRIP := $(DOCKER_RUN) strip
+$(info note: host is $(UNAME_S), not Linux -- compiling inside a $(DOCKER_IMAGE) container so binaries are real ELF, not Mach-O)
+endif
+
 SRC         := testing.c
 BUILD_DIR   := bin
 DECOMP_DIR  := decompiled
@@ -95,7 +117,7 @@ $(BUILD_DIR)/testing_static: $(SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/testing_stripped: $(SRC) | $(BUILD_DIR)
 	@echo "==> [stripped] $(CC) $(COMMON_FLAGS) $(FLAGS.stripped) -o $@ $(SRC), then strip"
 	$(CC) $(COMMON_FLAGS) $(FLAGS.stripped) -o $@ $(SRC)
-	strip --strip-all $@
+	$(STRIP) --strip-all $@
 
 $(BUILD_DIR)/testing_O0: $(SRC) | $(BUILD_DIR)
 	@echo "==> [O0] $(CC) $(COMMON_FLAGS) $(FLAGS.O0) -o $@ $(SRC)"

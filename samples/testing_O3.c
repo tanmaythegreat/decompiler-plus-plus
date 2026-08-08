@@ -13,8 +13,7 @@ int main(void)
 
     rax = __printf_chk(2, "abs=%d clamp=%d sum=%ld\n", 7, 10, 15);
     if (malloc(32) != 0) {
-        __asm__("movdqa xmm0,[rel 402050h]");
-        *(int *)rax = xmm0;
+        *(int *)rax = _mm_load_si128(xmm0, *(int *)0x402050);
         rax = 114;
         *(unsigned short *)(rax + 16) = 114;
         rax = puts(rax);
@@ -35,7 +34,7 @@ void _start(void)
 
     sa1 = rax;
     v1 = rsp;
-    __libc_start_main(0x4010b0, v1, rsp, 0, 0, rdx);
+    __libc_start_main(main, v1, rsp, 0, 0, rdx);
     __asm__("hlt");
 }
 
@@ -66,6 +65,11 @@ long sum_range(int a1, int a2)
     int edx;                     // register rdx
     int esi;                     // register rsi
     double xmm0;                 // register xmm0
+    double xmm1;                 // register xmm1
+    double xmm2;                 // register xmm2
+    double xmm3;                 // register xmm3
+    double xmm4;                 // register xmm4
+    double xmm6;                 // register xmm6
 
     edx = a2;
     if (a1 > a2) {
@@ -93,31 +97,23 @@ long sum_range(int a1, int a2)
                 }
             }
         } else {
-            __asm__("movdqa xmm6,[rel 402040h]");
+            rcx = esi;
+            xmm6 = _mm_load_si128(xmm6, *(int *)0x402040);
             rax = 0;
-            __asm__("pshufd xmm2,xmm7,0");
-            rcx = esi >> 2;
+            rcx /= 4;
             xmm0 = 0;
-            __asm__("paddd xmm2,[rel 402030h]");
+            xmm2 = _mm_add_epi32(_mm_shuffle_epi32(xmm2, rdi, 0), *(int *)0x402030);
             for (;;) {
-                __asm__("movdqa xmm1,xmm2");
-                __asm__("movdqa xmm3,xmm5");
-                __asm__("paddd xmm2,xmm6");
+                xmm1 = _mm_load_si128(xmm1, xmm2);
+                xmm2 = _mm_add_epi32(xmm2, xmm6);
                 rax++;
-                __asm__("pcmpgtd xmm3,xmm1");
-                __asm__("movdqa xmm4,xmm1");
-                __asm__("punpckldq xmm4,xmm3");
-                __asm__("punpckhdq xmm1,xmm3");
-                __asm__("paddq xmm0,xmm4");
-                __asm__("paddq xmm0,xmm1");
-                if (rax + 1 == rcx) {
+                xmm3 = _mm_cmpgt_epi32(xmm3, xmm1);
+                xmm0 = _mm_add_epi64(_mm_add_epi64(xmm0, xmm4), xmm1);
+                if (rax == rcx) {
                     break;
                 }
             }
-            __asm__("movdqa xmm1,xmm0");
-            __asm__("psrldq xmm1,8");
-            __asm__("paddq xmm0,xmm1");
-            rax = xmm0;
+            rax = _mm_add_epi64(xmm0, _mm_bsrli_si128(_mm_load_si128(xmm1, xmm0), 8));
             if ((esi & 3) != 0) {
                 esi &= -4;
                 rdi += esi & -4;

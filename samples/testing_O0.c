@@ -23,7 +23,7 @@ void _start(void)
 
     sa1 = rax;
     v1 = rsp;
-    __libc_start_main(0x401237, v1, rsp, 0, 0, rdx);
+    __libc_start_main(main, v1, rsp, 0, 0, rdx);
     __asm__("hlt");
 }
 
