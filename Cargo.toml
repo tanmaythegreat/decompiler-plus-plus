@@ -1,6 +1,12 @@
 [package]
-name = "decompiler-plus-plus"
+name = "mini_decompiler"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std","decoder","instr_info","nasm"] }
+object = "0.32"
+
+[[bin]]
+name = "mini_decompiler"
+path = "src/main.rs"
