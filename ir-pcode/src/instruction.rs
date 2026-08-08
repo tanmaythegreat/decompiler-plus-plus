@@ -82,6 +82,16 @@ pub enum Instruction {
     /// modeled (e.g. prefixes/padding) so lifting never silently drops
     /// bytes.
     Nop,
+
+    /// SSA φ-node: `dest = φ(srcs[0], srcs[1], ...)` where `srcs[i]` is
+    /// the value that reaches `dest` from the i-th predecessor block.
+    ///
+    /// φ-nodes are only present after an SSA construction pass rewrites
+    /// the IR. Lifted code never contains them — it uses plain `Copy`.
+    /// Every analysis pass that reads definitions (type inference, liveness,
+    /// etc.) must handle this variant; analyses that only care about
+    /// program-point reachability may safely ignore it.
+    Phi { dest: Varnode, srcs: Vec<Varnode> },
 }
 
 impl fmt::Display for Instruction {
@@ -111,6 +121,10 @@ impl fmt::Display for Instruction {
             Instruction::Call { target } => write!(f, "CALL {target}"),
             Instruction::Return => write!(f, "RETURN"),
             Instruction::Nop => write!(f, "NOP"),
+            Instruction::Phi { dest, srcs } => {
+                let src_list: Vec<String> = srcs.iter().map(|s| format!("{s}")).collect();
+                write!(f, "{dest} = PHI({})", src_list.join(", "))
+            }
         }
     }
 }

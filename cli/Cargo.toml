@@ -2,7 +2,7 @@
 name = "decompiler-cli"
 version.workspace = true
 edition.workspace = true
-description = "Phase 1 deliverable: a command-line tool that disassembles and lifts x86 bytes into the ir-pcode IR."
+description = "Runs the full Phase 1 + Phase 2 pipeline: disassembles and lifts x86 bytes into the ir-pcode IR, builds a CFG, runs constant propagation, and prints C pseudocode."
 
 [[bin]]
 name = "decompiler-cli"
@@ -12,3 +12,6 @@ path = "src/main.rs"
 decompiler-core = { path = "../decompiler-core" }
 ir-pcode = { path = "../ir-pcode" }
 arch-x86 = { path = "../arch-x86" }
+arch-arm = { path = "../arch-arm" }
+analysis-passes = { path = "../analysis-passes" }
+output-c = { path = "../output-c" }

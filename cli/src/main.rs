@@ -1,16 +1,22 @@
-//! Phase 1 deliverable CLI.
+//! Phase 1 + Phase 2 deliverable CLI.
 //!
 //! Wires the whole pipeline built so far together: `arch_x86::X86Disassembler`
 //! decodes raw bytes, `arch_x86::X86Lifter` lifts each decoded instruction
 //! into `ir_pcode::Instruction`s, and the results are accumulated into a
-//! `decompiler_core::Function` / `BasicBlock` and printed.
+//! `decompiler_core::Function` / `BasicBlock` and printed (Phase 1) --
+//! then `analysis_passes::CfgBuilder` turns that flat block into a real CFG,
+//! `analysis_passes::ConstantPropagation` runs a dataflow analysis over it
+//! and simplifies the IR in place, and `output_c::generate` renders the
+//! result as C-like pseudocode (Phase 2).
 //!
 //! Usage:
 //!   decompiler-cli                      # run the built-in demo function
 //!   decompiler-cli --hex "B8 05 00 00 00 C3" [--base 0x1000]
 //!   decompiler-cli --file path/to/raw.bin [--base 0x1000]
 
+use analysis_passes::{CfgBuilder, ConstantPropagation, PassManager, Structurer, TypeInference};
 use arch_x86::{X86Disassembler, X86Lifter};
+use arch_arm::{ArmDisassembler, ArmLifter};
 use decompiler_core::{BasicBlock, DecodeError, Disassembler, Function, Lifter, TempAllocator};
 use std::env;
 use std::fs;
@@ -76,11 +82,16 @@ fn parse_base(input: &str) -> Result<u64, String> {
 /// Disassemble + lift every instruction in `bytes` (starting at `base`) into
 /// a single `Function`, printing each step as it goes. Decoding stops at the
 /// first `ret`, at an error, or when the buffer is exhausted.
-fn process_function(name: &str, bytes: &[u8], base: u64) -> Function {
+fn process_function<D: Disassembler, L: Lifter<Instruction = D::Instruction>>(
+    name: &str,
+    bytes: &[u8],
+    base: u64,
+    disassembler: &D,
+    lifter: &L,
+) -> Function 
+where <D as Disassembler>::Instruction: std::fmt::Display {
     println!("\n=== {name} (base 0x{base:x}, {} bytes) ===", bytes.len());
 
-    let disassembler = X86Disassembler::new();
-    let lifter = X86Lifter::new();
     let mut temps = TempAllocator::new();
 
     let mut function = Function::new(name, base);
@@ -109,7 +120,11 @@ fn process_function(name: &str, bytes: &[u8], base: u64) -> Function {
                     println!("             \u{2514}\u{2500} {op}");
                 }
 
-                let is_ret = matches!(result.instruction, arch_x86::X86Instruction::Ret);
+                // Detect function end by checking for a Return op in the *lifted IR*,
+                // not the decoded instruction's debug string. This is architecture-
+                // agnostic: any `arch-*` backend that emits `Instruction::Return`
+                // (as both x86 `RET` and ARM `RET` do) will stop the decode loop.
+                let is_ret = ops.iter().any(|op| matches!(op, ir_pcode::Instruction::Return));
                 block.push(address, ops);
                 offset += result.length;
 
@@ -142,12 +157,45 @@ fn print_summary(function: &Function) {
     );
 }
 
+/// Phase 2: run the CFG-construction + constant-propagation pipeline over
+/// `function` (mutating it in place), then print the resulting graph and a
+/// pseudocode rendering. This is what turns the flat, single-block output
+/// `process_function` produces into the real multi-block CFG the roadmap's
+/// Phase 2 calls for.
+fn run_phase2(function: &mut Function) {
+    println!("\n  --- Phase 2-4: CFG, Dataflow, Type Inference, Structuring ---");
+    let pipeline = PassManager::new()
+        .with(CfgBuilder)
+        .with(ConstantPropagation)
+        .with(TypeInference)
+        .with(Structurer);
+    pipeline.run_verbose(function);
+
+    for block in &function.blocks {
+        println!(
+            "  block 0x{:x}  (preds: {:?}, succs: {:?})",
+            block.start_address, block.predecessors, block.successors
+        );
+        for li in &block.instructions {
+            for op in &li.ops {
+                println!("    0x{:x}:  {op}", li.address);
+            }
+        }
+    }
+
+    println!("\n  --- Phase 4: pseudocode (structured C) ---");
+    for line in output_c::generate(&*function).lines() {
+        println!("  {line}");
+    }
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
 
     let mut hex_arg: Option<String> = None;
     let mut file_arg: Option<String> = None;
     let mut base_arg: u64 = 0x1000;
+    let mut arch_arg: String = "x86".to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -164,14 +212,19 @@ fn run() -> Result<(), String> {
                 i += 1;
                 base_arg = parse_base(args.get(i).ok_or("--base requires a value")?)?;
             }
+            "--arch" => {
+                i += 1;
+                arch_arg = args.get(i).ok_or("--arch requires a value (x86 or arm)")?.clone();
+            }
             "--help" | "-h" => {
                 println!(
-                    "decompiler-cli - Phase 1 demo: disassemble + lift x86 bytes to IR\n\n\
+                    "decompiler-cli - disassemble + lift bytes to IR, then run full pipeline\n\n\
                      Usage:\n  \
                      decompiler-cli                              run the built-in demo\n  \
                      decompiler-cli --hex \"B8 05 00 00 00 C3\"     lift a hex byte string\n  \
                      decompiler-cli --file bytes.bin              lift a raw binary file\n  \
-                     decompiler-cli [...] --base 0x401000         set the load address (default 0x1000)"
+                     decompiler-cli [...] --base 0x401000         set the load address (default 0x1000)\n  \
+                     decompiler-cli [...] --arch arm              set architecture (x86 or arm, default x86)"
                 );
                 return Ok(());
             }
@@ -185,12 +238,38 @@ fn run() -> Result<(), String> {
     }
 
     if hex_arg.is_none() && file_arg.is_none() {
-        // No input given: run the built-in demos so `decompiler-cli` with no
-        // arguments is a self-contained demonstration of Phase 1.
-        let f1 = process_function("demo_function (mov/add/cmp/jne/jmp/ret)", DEMO_BYTES, 0x1000);
+        if arch_arg == "arm" {
+            // ARM mock demo bytes
+            // MOV X0, #5
+            // ADD X0, X0, #3
+            // CMP X0, #8
+            // B.NE +8
+            // MOV X1, #1
+            // B +8
+            // MOV X1, #0
+            // RET
+            let arm_demo: &[u8] = &[
+                0xa0, 0x00, 0x00, 0x10, // mov x0, 5
+                0xa0, 0x08, 0x00, 0x12, // add x0, x0, 3
+                0x00, 0x20, 0x00, 0x13, // cmp x0, 8 (wait, our mock: lhs=0, imm=8) -> 0x13 << 24 | (8 << 5) | 0
+                0x08, 0x00, 0x00, 0x17, // b.ne +8 -> 0x17 << 24 | 8
+                0x21, 0x00, 0x00, 0x10, // mov x1, 1 -> 0x10 << 24 | (1 << 5) | 1
+                0x08, 0x00, 0x00, 0x14, // b +8 -> 0x14 << 24 | 8
+                0x01, 0x00, 0x00, 0x10, // mov x1, 0 -> 0x10 << 24 | (0 << 5) | 1
+                0x00, 0x00, 0x00, 0x18, // ret
+            ];
+            let mut f1 = process_function("demo_arm", arm_demo, 0x1000, &ArmDisassembler::new(), &ArmLifter::new());
+            print_summary(&f1);
+            run_phase2(&mut f1);
+            return Ok(());
+        }
+        
+        let mut f1 = process_function("demo_function (mov/add/cmp/jne/jmp/ret)", DEMO_BYTES, 0x1000, &X86Disassembler::new(), &X86Lifter::new());
         print_summary(&f1);
-        let f2 = process_function("demo_call (call)", CALL_DEMO_BYTES, 0x2000);
+        run_phase2(&mut f1);
+        let mut f2 = process_function("demo_call (call)", CALL_DEMO_BYTES, 0x2000, &X86Disassembler::new(), &X86Lifter::new());
         print_summary(&f2);
+        run_phase2(&mut f2);
         return Ok(());
     }
 
@@ -201,8 +280,15 @@ fn run() -> Result<(), String> {
         fs::read(&path).map_err(|e| format!("failed to read {path}: {e}"))?
     };
 
-    let function = process_function("input", &bytes, base_arg);
-    print_summary(&function);
+    if arch_arg == "arm" {
+        let mut function = process_function("input", &bytes, base_arg, &ArmDisassembler::new(), &ArmLifter::new());
+        print_summary(&function);
+        run_phase2(&mut function);
+    } else {
+        let mut function = process_function("input", &bytes, base_arg, &X86Disassembler::new(), &X86Lifter::new());
+        print_summary(&function);
+        run_phase2(&mut function);
+    }
     Ok(())
 }
 

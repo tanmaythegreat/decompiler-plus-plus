@@ -83,6 +83,33 @@ impl PartialEq for Varnode {
 }
 impl Eq for Varnode {}
 
+impl PartialOrd for Varnode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Varnode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.space.cmp(&other.space)
+            .then(self.offset.cmp(&other.offset))
+            .then(self.size.cmp(&other.size))
+    }
+}
+
+// Manual `Hash` impl (rather than `#[derive]`) is required here for the same
+// reason `PartialEq` is manual: hashing must agree with equality, which
+// ignores `name`. This is what lets Phase 2's dataflow analyses use
+// `Varnode` directly as a `HashMap`/`HashSet` key (e.g. "what's the current
+// lattice value of this Varnode?") without a wrapper type.
+impl std::hash::Hash for Varnode {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.space.hash(state);
+        self.offset.hash(state);
+        self.size.hash(state);
+    }
+}
+
 impl fmt::Display for Varnode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(name) = &self.name {
@@ -99,6 +126,13 @@ impl fmt::Display for Varnode {
 /// A monotonically increasing source of fresh `Unique`-space Varnodes, used
 /// by lifters whenever a machine instruction's semantics require a
 /// scratch/intermediate value that has no architectural storage of its own.
+///
+/// # Contract
+/// Each `TempAllocator` instance is **scoped to exactly one function**. Two
+/// `Unique`-space Varnodes with the same `offset` produced by *different*
+/// allocators would compare as equal (same `(space, offset, size)` triple)
+/// even though they refer to different scratch values. Callers must create
+/// one fresh allocator per function and not share allocators across functions.
 #[derive(Debug, Default)]
 pub struct TempAllocator {
     next: u64,
@@ -132,6 +166,16 @@ mod tests {
         let eax = Varnode::register(0, 4, "EAX");
         let ecx = Varnode::register(1, 4, "ECX");
         assert_ne!(eax, ecx);
+    }
+
+    #[test]
+    fn hash_ignores_debug_name_like_eq_does() {
+        use std::collections::HashSet;
+        let a = Varnode::register(0, 4, "EAX");
+        let b = Varnode::new(AddressSpace::Register, 0, 4);
+        let mut set = HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b), "equal Varnodes must hash the same regardless of name");
     }
 
     #[test]

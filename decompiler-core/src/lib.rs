@@ -12,7 +12,7 @@ mod traits;
 mod types;
 
 pub use traits::{DecodeError, Disassembler, DisassemblyResult, Lifter};
-pub use types::{BasicBlock, Function, LiftedInstruction, Variable};
+pub use types::{BasicBlock, DataType, Function, HighLevelAst, LiftedInstruction, Variable};
 
 // Re-export the IR crate's types so downstream crates can pull everything
 // they need (`decompiler_core::Instruction`, `decompiler_core::Varnode`,
