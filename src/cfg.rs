@@ -4,7 +4,79 @@
 // This is the reduced-scope stand-in for `analysis-passes` + `output-c`.
 
 use crate::ir::*;
+use crate::lifter::{reg_family, sysv_arg_index};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+/// Best-effort recovery of a function's own parameter count and return
+/// type from its (already-lifted, address-ordered) instruction list --
+/// same trick real decompilers use when there's no symbol/debug info to
+/// read a signature from: a SysV arg register (rdi, rsi, rdx, rcx, r8,
+/// r9) counts as an incoming parameter if the *first* thing the function
+/// does with it is read it, before ever writing it -- a value nothing in
+/// this function produced can only have come from the caller. Takes the
+/// highest such register's index + 1 as the count, so an unused-but-
+/// passed middle parameter (rare, but possible) doesn't create a gap;
+/// the flip side is a truly unused *trailing* parameter (never read at
+/// all) is invisible to this and won't be counted -- no way to tell that
+/// apart from "this function only takes N args" without debug info.
+///
+/// Return type: "void" unless something writes to rax anywhere in the
+/// body. `Ret` always carries `rax` in this IR (see lifter.rs), so
+/// checking real writes -- not just the synthetic return -- is what
+/// actually distinguishes a function that produces a value from one
+/// that doesn't.
+fn detect_signature(instrs: &[LiftedInsn]) -> (usize, bool) {
+    let mut written = [false; 6];
+    let mut read_before_write = [false; 6];
+    let mut rax_written = false;
+
+    for ins in instrs {
+        for op in &ins.ops {
+            let reads: Vec<&Value> = match op {
+                Instr::Copy { src, .. } => vec![src],
+                // `xor reg, reg` is the standard x86 zero-idiom, not a
+                // genuine read of reg's old value (that's the whole
+                // point of using it over `mov reg, 0`) -- counting it
+                // would flag any first-touched arg register as an
+                // incoming param just because the compiler happened to
+                // zero it that way (e.g. `xor r8d, r8d` in the _start
+                // stub, or `xor eax, eax` before a 0 return).
+                Instr::Bin { op: BinOp::Xor, lhs, rhs, .. } if lhs == rhs => vec![],
+                Instr::Bin { lhs, rhs, .. } => vec![lhs, rhs],
+                Instr::Un { src, .. } => vec![src],
+                Instr::Cmp { lhs, rhs, .. } => vec![lhs, rhs],
+                Instr::Call { args, .. } => args.iter().collect(),
+                Instr::Ret { val: Some(v) } => vec![v],
+                _ => vec![],
+            };
+            for v in reads {
+                if let Value::Reg(name) = v {
+                    if let Some(idx) = sysv_arg_index(name) {
+                        if !written[idx] {
+                            read_before_write[idx] = true;
+                        }
+                    }
+                }
+            }
+
+            let dst = match op {
+                Instr::Copy { dst, .. } | Instr::Bin { dst, .. } | Instr::Un { dst, .. } => Some(dst),
+                _ => None,
+            };
+            if let Some(Value::Reg(name)) = dst {
+                if let Some(idx) = sysv_arg_index(name) {
+                    written[idx] = true;
+                }
+                if reg_family(name) == "rax" {
+                    rax_written = true;
+                }
+            }
+        }
+    }
+
+    let param_count = read_before_write.iter().rposition(|&b| b).map(|i| i + 1).unwrap_or(0);
+    (param_count, rax_written)
+}
 
 pub struct Block {
     pub addr: u64,
@@ -19,6 +91,12 @@ pub struct Function {
     pub entry: u64,
     pub instrs: Vec<LiftedInsn>,
     pub blocks: BTreeMap<u64, Block>,
+    /// Recovered arg count (see `detect_signature`) -- SysV int/pointer
+    /// args only, so a function that's actually variadic-with-floats or
+    /// takes float params will undercount.
+    pub param_count: usize,
+    /// True if nothing in the function ever writes rax -- see `detect_signature`.
+    pub is_void: bool,
 }
 
 impl Function {
@@ -112,7 +190,9 @@ impl Function {
             }
         }
 
-        Function { name, entry, instrs, blocks }
+        let (param_count, has_return_value) = detect_signature(&instrs);
+
+        Function { name, entry, instrs, blocks, param_count, is_void: !has_return_value }
     }
 
     /// Iterative dominator computation (Cooper/Harvey/Kennedy) over addresses
@@ -212,7 +292,16 @@ impl Function {
         }
 
         let mut out = String::new();
-        out.push_str(&format!("int {}(...)\n{{\n", self.name));
+        let ret_ty = if self.is_void { "void" } else { "int" };
+        let params = if self.param_count == 0 {
+            "void".to_string()
+        } else {
+            (1..=self.param_count)
+                .map(|i| format!("int a{}", i))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push_str(&format!("{} {}({})\n{{\n", ret_ty, self.name, params));
         let mut visited: BTreeSet<u64> = BTreeSet::new();
         self.emit_region(self.entry, None, 1, &headers, &idom, &mut visited, &mut out);
         out.push_str("}\n");
@@ -364,6 +453,17 @@ impl Function {
                     Instr::CBranch { .. } | Instr::Branch { .. } => {} // handled by structuring
                     Instr::Unknown { text } if text.starts_with("__cond__") => {}
                     Instr::Cmp { .. } => {} // condition text pulled separately
+                    Instr::Ret { .. } => {
+                        // IR always carries `rax` on Ret (lifter.rs can't
+                        // tell void from int at the single-instruction
+                        // level) -- use the whole-function signature
+                        // (detect_signature) to decide what to print.
+                        if self.is_void {
+                            out.push_str(&format!("{}return;\n", pad));
+                        } else {
+                            out.push_str(&format!("{}return rax;\n", pad));
+                        }
+                    }
                     other => out.push_str(&format!("{}{};\n", pad, other)),
                 }
             }

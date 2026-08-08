@@ -38,6 +38,24 @@ straight-line functions, if/else, and counting `while` loops.
   calls in unlinked `.o` files are also resolved by name (read straight
   from `.rela.text`), instead of the bogus `sub_<addr>` you'd get from
   decoding an unpatched call displacement.
-
-This is Phase 1–2 (+ a slice of Phase 4) of the 5-phase roadmap in the
-design doc — a working foundation, not the full system.
+- Calling convention: System V AMD64 (the ELF/Linux ABI — the only one
+  relevant here, since input is always ELF) integer/pointer args only
+  (`rdi, rsi, rdx, rcx, r8, r9`); no float/`xmm0-7` args, no 7th+
+  stack-passed args, no struct-by-value. Both directions are recovered
+  with a simple forward register-tracking scan (not real dataflow):
+  - **Call sites**: each `call`'s arg list is filled in from whichever
+    of the 6 arg registers were actually (re)written since the previous
+    call, in contiguous rdi→r9 order, substituting the real
+    expression/immediate last written to each one — instead of a fixed
+    placeholder triple. Resets after every call, since a callee may
+    clobber all of them.
+  - **Function signature**: a function's own param count is the
+    highest arg register that's *read before ever written* anywhere in
+    its body (i.e. its value can only have come from the caller); a
+    function only gets `int` as its return type if something writes
+    `rax` anywhere in the body, otherwise `void`.
+  - Known gaps: a register set via `push`/`pop` (both no-ops in this
+    IR) is invisible to this tracking; a loop back-edge or args built
+    up out of register order can under-count; a genuinely-unused
+    *trailing* param (never read at all) can't be told apart from "the
+    function only takes N args".
