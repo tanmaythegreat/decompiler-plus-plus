@@ -87,8 +87,13 @@ fn sanitize_call_name(n: &str) -> String {
 /// would break a single machine instruction into several p-code ops.
 /// `symbols` maps known function addresses to their names (from the
 /// object file's symbol table) so `call` targets can be rendered by name
-/// instead of a bare `sub_<addr>` when we know it.
-pub fn lift(insn: &Instruction, fmt_out: &mut String, symbols: &HashMap<u64, String>) -> LiftedInsn {
+/// instead of a bare `sub_<addr>` when we know it. `reloc_symbols` maps
+/// call-site addresses (address of the call's 4-byte displacement field)
+/// to names, for unlinked object files where the displacement itself
+/// isn't a real address yet -- see `resolve_reloc_call_targets` in
+/// main.rs. When both apply, the relocation-based name wins, since it's
+/// authoritative for `.o` files where `near_branch_target` is bogus.
+pub fn lift(insn: &Instruction, fmt_out: &mut String, symbols: &HashMap<u64, String>, reloc_symbols: &HashMap<u64, String>) -> LiftedInsn {
     let mut formatter = NasmFormatter::new();
     fmt_out.clear();
     formatter.format(insn, fmt_out);
@@ -165,10 +170,19 @@ pub fn lift(insn: &Instruction, fmt_out: &mut String, symbols: &HashMap<u64, Str
         }
         Mnemonic::Call => {
             let target = if insn.op0_kind() == OpKind::NearBranch64 || insn.op0_kind() == OpKind::NearBranch32 {
-                let addr = insn.near_branch_target();
-                match symbols.get(&addr) {
-                    Some(name) => sanitize_call_name(name),
-                    None => format!("sub_{:x}", addr),
+                // Displacement field is the last 4 bytes of the (5-byte)
+                // near-call encoding; a relocation entry there (if any)
+                // is authoritative over the raw, possibly-unpatched
+                // near_branch_target -- see resolve_reloc_call_targets.
+                let field_addr = insn.ip() + insn.len() as u64 - 4;
+                if let Some(name) = reloc_symbols.get(&field_addr) {
+                    sanitize_call_name(name)
+                } else {
+                    let addr = insn.near_branch_target();
+                    match symbols.get(&addr) {
+                        Some(name) => sanitize_call_name(name),
+                        None => format!("sub_{:x}", addr),
+                    }
                 }
             } else {
                 "indirect_call".to_string()
@@ -202,7 +216,7 @@ pub fn lift(insn: &Instruction, fmt_out: &mut String, symbols: &HashMap<u64, Str
 }
 
 /// Decode + lift every instruction in `code` starting at virtual address `base`.
-pub fn lift_region(code: &[u8], base: u64, symbols: &HashMap<u64, String>) -> Vec<LiftedInsn> {
+pub fn lift_region(code: &[u8], base: u64, symbols: &HashMap<u64, String>, reloc_symbols: &HashMap<u64, String>) -> Vec<LiftedInsn> {
     let mut decoder = Decoder::with_ip(64, code, base, DecoderOptions::NONE);
     let mut insn = Instruction::default();
     let mut out = Vec::new();
@@ -212,7 +226,7 @@ pub fn lift_region(code: &[u8], base: u64, symbols: &HashMap<u64, String>) -> Ve
         if insn.is_invalid() {
             break;
         }
-        out.push(lift(&insn, &mut scratch, symbols));
+        out.push(lift(&insn, &mut scratch, symbols, reloc_symbols));
     }
     out
 }

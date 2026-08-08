@@ -29,7 +29,15 @@ straight-line functions, if/else, and counting `while` loops.
 - Structuring handles simple diamonds and single back-edge loops;
   anything more irregular (switch/jump tables, nested/interleaved
   control flow, obfuscated CFGs) falls back to `if (cond) goto ...`.
-- No inlining/PLT resolution beyond raw call targets.
+- No inlining beyond raw call targets. PLT-based calls in dynamically
+  linked binaries *are* resolved to real names (`printf`, `malloc`, ...)
+  by decoding the `.plt`/`.plt.sec`/`.plt.got` stubs and matching them
+  against the binary's own `.rela.plt`/`.rela.dyn` relocations + dynamic
+  symbol table — no external `libc.so`/`ld.so` needed, since imported
+  symbol *names* are already embedded in the binary itself. Same-object
+  calls in unlinked `.o` files are also resolved by name (read straight
+  from `.rela.text`), instead of the bogus `sub_<addr>` you'd get from
+  decoding an unpatched call displacement.
 
 This is Phase 1–2 (+ a slice of Phase 4) of the 5-phase roadmap in the
 design doc — a working foundation, not the full system.

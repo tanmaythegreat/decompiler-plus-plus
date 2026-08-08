@@ -1,7 +1,11 @@
-// testing_lib.c — no main(). Standalone functions only, meant to be
-// compiled to a .o with `gcc -c` (can't be linked into an executable
-// as-is since there's no entry point). The decompiler reads .o files
-// fine directly.
+// testing.c — has main(), so the Makefile builds all 7 variants
+// (O0-O3, static, stripped, pie, obj). Mixes local control-flow
+// (if/else, loop) with libc calls, so you can check both structuring
+// and PLT name resolution (printf/malloc/free/puts/strcpy) in one file.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 int abs_val(int x) {
     if (x < 0) {
@@ -30,4 +34,27 @@ long sum_range(int start, int end) {
 
 int is_even(int n) {
     return (n & 1) == 0;
+}
+
+int main(int argc, char **argv) {
+    int a = abs_val(-7);
+    int c = clamp(15, 0, 10);
+    long s = sum_range(1, 5);
+
+    printf("abs=%d clamp=%d sum=%ld\n", a, c, s);
+
+    char *buf = malloc(32);
+    if (buf) {
+        strcpy(buf, "hello, decompiler");
+        puts(buf);
+        free(buf);
+    }
+
+    if (is_even(a)) {
+        printf("even\n");
+    } else {
+        printf("odd\n");
+    }
+
+    return 0;
 }
