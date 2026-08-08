@@ -1,119 +1,72 @@
-// cfg.rs — builds basic blocks + CFG from lifted instructions, computes
-// dominators, finds loop back-edges, and does a best-effort structuring
-// pass (if/else, while) with goto fallback for anything it can't match.
-// This is the reduced-scope stand-in for `analysis-passes` + `output-c`.
+// cfg.rs — basic blocks, dominators, post-dominators, structuring.
+//
+// Fixes over the original:
+//
+//  * The old structurer decided an `if`'s merge point with the ad-hoc
+//    rule "does one branch have a single successor equal to the other".
+//    Two `if`s in a row (`clamp` in the sample program) matched none of
+//    its three shapes, so it fell through to `if (c) goto A; else goto B;`
+//    and then continued from B's *successor*, dropping every statement in
+//    B and everything after it. The whole tail of `clamp` vanished from
+//    the output. Merge points now come from the immediate post-dominator,
+//    which is what that rule was approximating.
+//  * The old renderer emitted `goto Lxxxx` but never emitted a single
+//    label, so its output could not compile even in principle.
+//  * `reverse_postorder` recursed once per basic block and would blow the
+//    stack on a large function; it's an explicit worklist now.
+//  * `dominators` indexed `rpo_index[&a]` and `idom[&a]` unguarded, so a
+//    block reachable only through an unstructured edge panicked the
+//    process.
+//  * Loop bodies are real natural loops, and `break`/`continue` are
+//    emitted instead of jumping out with a goto.
 
 use crate::ir::*;
-use crate::lifter::{reg_family, sysv_arg_index};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-/// Best-effort recovery of a function's own parameter count and return
-/// type from its (already-lifted, address-ordered) instruction list --
-/// same trick real decompilers use when there's no symbol/debug info to
-/// read a signature from: a SysV arg register (rdi, rsi, rdx, rcx, r8,
-/// r9) counts as an incoming parameter if the *first* thing the function
-/// does with it is read it, before ever writing it -- a value nothing in
-/// this function produced can only have come from the caller. Takes the
-/// highest such register's index + 1 as the count, so an unused-but-
-/// passed middle parameter (rare, but possible) doesn't create a gap;
-/// the flip side is a truly unused *trailing* parameter (never read at
-/// all) is invisible to this and won't be counted -- no way to tell that
-/// apart from "this function only takes N args" without debug info.
-///
-/// Return type: "void" unless something writes to rax anywhere in the
-/// body. `Ret` always carries `rax` in this IR (see lifter.rs), so
-/// checking real writes -- not just the synthetic return -- is what
-/// actually distinguishes a function that produces a value from one
-/// that doesn't.
-fn detect_signature(instrs: &[LiftedInsn]) -> (usize, bool) {
-    let mut written = [false; 6];
-    let mut read_before_write = [false; 6];
-    let mut rax_written = false;
-
-    for ins in instrs {
-        for op in &ins.ops {
-            let reads: Vec<&Value> = match op {
-                Instr::Copy { src, .. } => vec![src],
-                // `xor reg, reg` is the standard x86 zero-idiom, not a
-                // genuine read of reg's old value (that's the whole
-                // point of using it over `mov reg, 0`) -- counting it
-                // would flag any first-touched arg register as an
-                // incoming param just because the compiler happened to
-                // zero it that way (e.g. `xor r8d, r8d` in the _start
-                // stub, or `xor eax, eax` before a 0 return).
-                Instr::Bin { op: BinOp::Xor, lhs, rhs, .. } if lhs == rhs => vec![],
-                Instr::Bin { lhs, rhs, .. } => vec![lhs, rhs],
-                Instr::Un { src, .. } => vec![src],
-                Instr::Cmp { lhs, rhs, .. } => vec![lhs, rhs],
-                Instr::Call { args, .. } => args.iter().collect(),
-                Instr::Ret { val: Some(v) } => vec![v],
-                _ => vec![],
-            };
-            for v in reads {
-                if let Value::Reg(name) = v {
-                    if let Some(idx) = sysv_arg_index(name) {
-                        if !written[idx] {
-                            read_before_write[idx] = true;
-                        }
-                    }
-                }
-            }
-
-            let dst = match op {
-                Instr::Copy { dst, .. } | Instr::Bin { dst, .. } | Instr::Un { dst, .. } => Some(dst),
-                _ => None,
-            };
-            if let Some(Value::Reg(name)) = dst {
-                if let Some(idx) = sysv_arg_index(name) {
-                    written[idx] = true;
-                }
-                if reg_family(name) == "rax" {
-                    rax_written = true;
-                }
-            }
-        }
-    }
-
-    let param_count = read_before_write.iter().rposition(|&b| b).map(|i| i + 1).unwrap_or(0);
-    (param_count, rax_written)
-}
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub struct Block {
     pub addr: u64,
-    pub instrs: Vec<usize>, // indices into the function's instr vec
-    pub succs: Vec<u64>,    // 0, 1 (unconditional), or 2 (cond: [true, false])
+    pub instrs: Vec<usize>,
+    pub succs: Vec<u64>,
     pub preds: Vec<u64>,
     pub is_cond: bool,
+    /// condition of the terminating branch, if any
+    pub cond: Option<Expr>,
+    pub ends_return: bool,
 }
 
-pub struct Function {
-    pub name: String,
-    pub entry: u64,
-    pub instrs: Vec<LiftedInsn>,
-    pub blocks: BTreeMap<u64, Block>,
-    /// Recovered arg count (see `detect_signature`) -- SysV int/pointer
-    /// args only, so a function that's actually variadic-with-floats or
-    /// takes float params will undercount.
-    pub param_count: usize,
-    /// True if nothing in the function ever writes rax -- see `detect_signature`.
-    pub is_void: bool,
+/// Structured output tree.
+pub enum CNode {
+    Stmts(Vec<Stmt>),
+    If { cond: Expr, then_: Vec<CNode>, else_: Vec<CNode> },
+    While { cond: Expr, body: Vec<CNode> },
+    DoWhile { body: Vec<CNode>, cond: Expr },
+    Forever { body: Vec<CNode> },
+    Break,
+    Continue,
+    Goto(u64),
+    Label(u64),
 }
 
-impl Function {
-    /// Build basic blocks + edges from a flat, address-sorted instruction stream.
-    pub fn build(name: String, mut instrs: Vec<LiftedInsn>) -> Function {
-        instrs.sort_by_key(|i| i.addr);
-        let entry = instrs.first().map(|i| i.addr).unwrap_or(0);
+pub struct Cfg {
+    pub blocks: Vec<Block>,
+    pub index: HashMap<u64, usize>,
+    pub entry: usize,
+}
 
-        // 1. find leaders
-        let mut leaders: BTreeSet<u64> = BTreeSet::new();
-        leaders.insert(entry);
+impl Cfg {
+    pub fn build(instrs: &[LiftedInsn]) -> Cfg {
+        let entry_addr = instrs.first().map(|i| i.addr).unwrap_or(0);
         let addr_index: HashMap<u64, usize> =
             instrs.iter().enumerate().map(|(i, ins)| (ins.addr, i)).collect();
+
+        let mut leaders: BTreeSet<u64> = BTreeSet::new();
+        leaders.insert(entry_addr);
         for (i, ins) in instrs.iter().enumerate() {
             if ins.is_block_end {
                 for &t in &ins.targets {
-                    leaders.insert(t);
+                    if addr_index.contains_key(&t) {
+                        leaders.insert(t);
+                    }
                 }
                 if let Some(next) = instrs.get(i + 1) {
                     leaders.insert(next.addr);
@@ -121,18 +74,16 @@ impl Function {
             }
         }
 
-        // 2. group instructions into blocks between consecutive leaders
         let leader_vec: Vec<u64> = leaders.into_iter().collect();
-        let mut blocks: BTreeMap<u64, Block> = BTreeMap::new();
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut index: HashMap<u64, usize> = HashMap::new();
+
         for (li, &laddr) in leader_vec.iter().enumerate() {
             let next_leader = leader_vec.get(li + 1).copied();
-            let start_idx = match addr_index.get(&laddr) {
-                Some(&ix) => ix,
-                None => continue, // target outside our region (external call etc)
-            };
+            let Some(&start_idx) = addr_index.get(&laddr) else { continue };
             let mut idxs = Vec::new();
             let mut j = start_idx;
-            loop {
+            while j < instrs.len() {
                 let ins = &instrs[j];
                 if let Some(nl) = next_leader {
                     if ins.addr >= nl {
@@ -144,96 +95,179 @@ impl Function {
                     break;
                 }
                 j += 1;
-                if j >= instrs.len() {
-                    break;
-                }
             }
             if idxs.is_empty() {
                 continue;
             }
-            let last = &instrs[*idxs.last().unwrap()];
+
+            let last_idx = *idxs.last().unwrap();
+            let last = &instrs[last_idx];
             let mut succs = Vec::new();
             let mut is_cond = false;
-            match last.ops.iter().find(|o| matches!(o, Instr::CBranch { .. } | Instr::Branch { .. })) {
-                Some(Instr::CBranch { target }) => {
-                    succs.push(*target); // true
-                    if let Some(next) = instrs.get(*idxs.last().unwrap() + 1) {
-                        succs.push(next.addr); // false / fallthrough
+            let mut cond = None;
+            let mut ends_return = false;
+
+            let branch = last.stmts.iter().find(|s| {
+                matches!(s, Stmt::If { .. } | Stmt::Goto(_) | Stmt::Return(_))
+            });
+            match branch {
+                Some(Stmt::If { cond: c, target }) => {
+                    succs.push(*target);
+                    if let Some(next) = instrs.get(last_idx + 1) {
+                        succs.push(next.addr);
                     }
                     is_cond = true;
+                    cond = Some(c.clone());
                 }
-                Some(Instr::Branch { target }) => {
-                    succs.push(*target);
-                }
+                Some(Stmt::Goto(t)) => succs.push(*t),
+                Some(Stmt::Return(_)) => ends_return = true,
                 _ => {
-                    if !matches!(last.ops.last(), Some(Instr::Ret { .. })) {
-                        if let Some(next) = instrs.get(*idxs.last().unwrap() + 1) {
+                    if last.falls_through {
+                        if let Some(next) = instrs.get(last_idx + 1) {
                             succs.push(next.addr);
                         }
                     }
                 }
             }
-            blocks.insert(
-                laddr,
-                Block { addr: laddr, instrs: idxs, succs, preds: Vec::new(), is_cond },
-            );
+            // drop edges to addresses outside this function's range
+            succs.retain(|t| addr_index.contains_key(t));
+
+            index.insert(laddr, blocks.len());
+            blocks.push(Block {
+                addr: laddr,
+                instrs: idxs,
+                succs,
+                preds: Vec::new(),
+                is_cond,
+                cond,
+                ends_return,
+            });
         }
 
-        // 3. fill preds
-        let succ_pairs: Vec<(u64, u64)> = blocks
-            .values()
+        let pairs: Vec<(u64, u64)> = blocks
+            .iter()
             .flat_map(|b| b.succs.iter().map(move |&s| (b.addr, s)))
             .collect();
-        for (from, to) in succ_pairs {
-            if let Some(b) = blocks.get_mut(&to) {
-                b.preds.push(from);
+        for (from, to) in pairs {
+            if let Some(&i) = index.get(&to) {
+                blocks[i].preds.push(from);
             }
         }
 
-        let (param_count, has_return_value) = detect_signature(&instrs);
-
-        Function { name, entry, instrs, blocks, param_count, is_void: !has_return_value }
+        let entry = index.get(&entry_addr).copied().unwrap_or(0);
+        Cfg { blocks, index, entry }
     }
 
-    /// Iterative dominator computation (Cooper/Harvey/Kennedy) over addresses
-    /// in reverse-postorder.
-    fn dominators(&self) -> HashMap<u64, u64> {
-        let rpo = self.reverse_postorder();
-        let rpo_index: HashMap<u64, usize> =
-            rpo.iter().enumerate().map(|(i, &a)| (a, i)).collect();
-        let mut idom: HashMap<u64, u64> = HashMap::new();
-        idom.insert(self.entry, self.entry);
+    fn succ_idx(&self, b: usize) -> Vec<usize> {
+        self.blocks[b].succs.iter().filter_map(|s| self.index.get(s).copied()).collect()
+    }
+    fn pred_idx(&self, b: usize) -> Vec<usize> {
+        self.blocks[b].preds.iter().filter_map(|s| self.index.get(s).copied()).collect()
+    }
 
-        let intersect = |mut a: u64, mut b: u64, idom: &HashMap<u64, u64>, rpo_index: &HashMap<u64, usize>| -> u64 {
-            while a != b {
-                while rpo_index[&a] > rpo_index[&b] {
-                    a = idom[&a];
+    /// Iterative DFS reverse-postorder. The original recursed and would
+    /// overflow the stack on large functions.
+    fn rpo(&self) -> Vec<usize> {
+        if self.blocks.is_empty() {
+            return vec![];
+        }
+        let mut visited = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack: Vec<(usize, usize)> = vec![(self.entry, 0)];
+        visited[self.entry] = true;
+        while let Some((n, ci)) = stack.pop() {
+            let succs = self.succ_idx(n);
+            if ci < succs.len() {
+                stack.push((n, ci + 1));
+                let s = succs[ci];
+                if !visited[s] {
+                    visited[s] = true;
+                    stack.push((s, 0));
                 }
-                while rpo_index[&b] > rpo_index[&a] {
-                    b = idom[&b];
+            } else {
+                post.push(n);
+            }
+        }
+        post.reverse();
+        post
+    }
+
+    /// Cooper/Harvey/Kennedy iterative dominators.
+    pub fn dominators(&self) -> Vec<Option<usize>> {
+        let order = self.rpo();
+        let n = self.blocks.len();
+        let mut pos = vec![usize::MAX; n];
+        for (i, &b) in order.iter().enumerate() {
+            pos[b] = i;
+        }
+        let mut idom: Vec<Option<usize>> = vec![None; n];
+        if order.is_empty() {
+            return idom;
+        }
+        idom[self.entry] = Some(self.entry);
+
+        let intersect = |mut a: usize, mut b: usize, idom: &Vec<Option<usize>>| -> Option<usize> {
+            let mut guard = 0;
+            while a != b {
+                guard += 1;
+                if guard > 4 * n + 8 {
+                    return None;
+                }
+                // A root is its own immediate dominator, so walking up from
+                // one never terminates on its own — the outer guard never
+                // gets a chance to fire.
+                while pos[a] > pos[b] {
+                    let up = idom[a]?;
+                    if up == a {
+                        return None;
+                    }
+                    a = up;
+                }
+                while pos[b] > pos[a] {
+                    let up = idom[b]?;
+                    if up == b {
+                        return None;
+                    }
+                    b = up;
                 }
             }
-            a
+            Some(a)
         };
 
+        // The fixpoint is only guaranteed to settle on a reducible graph
+        // whose blocks all reach the exit. Optimised code has neither
+        // property (an infinite loop has no path to a `ret`), and there the
+        // fallback inside `intersect` can flip an entry back and forth
+        // forever. Cap the rounds: a partial dominator tree structures a
+        // little worse, a hang structures nothing at all.
+        let mut rounds = 0;
         let mut changed = true;
         while changed {
+            rounds += 1;
+            if rounds > 2 * n + 16 {
+                break;
+            }
             changed = false;
-            for &addr in rpo.iter().filter(|&&a| a != self.entry) {
-                let block = &self.blocks[&addr];
-                let mut new_idom: Option<u64> = None;
-                for &p in &block.preds {
-                    if !idom.contains_key(&p) {
+            for &b in order.iter() {
+                if b == self.entry {
+                    continue;
+                }
+                let mut new: Option<usize> = None;
+                for p in self.pred_idx(b) {
+                    if pos[p] == usize::MAX || idom[p].is_none() {
                         continue;
                     }
-                    new_idom = Some(match new_idom {
+                    new = Some(match new {
                         None => p,
-                        Some(cur) => intersect(cur, p, &idom, &rpo_index),
+                        Some(cur) => match intersect(cur, p, &idom) {
+                            Some(x) => x,
+                            None => cur,
+                        },
                     });
                 }
-                if let Some(ni) = new_idom {
-                    if idom.get(&addr) != Some(&ni) {
-                        idom.insert(addr, ni);
+                if let Some(ni) = new {
+                    if idom[b] != Some(ni) {
+                        idom[b] = Some(ni);
                         changed = true;
                     }
                 }
@@ -242,266 +276,446 @@ impl Function {
         idom
     }
 
-    fn reverse_postorder(&self) -> Vec<u64> {
-        let mut visited = BTreeSet::new();
+    /// Post-dominators, via the same algorithm on the reverse graph.
+    /// This is what makes correct `if`/`if-else` merge points possible.
+    pub fn post_dominators(&self) -> Vec<Option<usize>> {
+        let n = self.blocks.len();
+        let exits: Vec<usize> =
+            (0..n).filter(|&b| self.succ_idx(b).is_empty()).collect();
+        let mut idom: Vec<Option<usize>> = vec![None; n];
+        if exits.is_empty() {
+            return idom;
+        }
+
+        // reverse postorder of the reverse graph, seeded from every exit
+        let mut visited = vec![false; n];
         let mut post = Vec::new();
-        fn dfs(f: &Function, addr: u64, visited: &mut BTreeSet<u64>, post: &mut Vec<u64>) {
-            if visited.contains(&addr) || !f.blocks.contains_key(&addr) {
-                return;
+        for &e in &exits {
+            if visited[e] {
+                continue;
             }
-            visited.insert(addr);
-            if let Some(b) = f.blocks.get(&addr) {
-                for &s in &b.succs {
-                    dfs(f, s, visited, post);
+            let mut stack: Vec<(usize, usize)> = vec![(e, 0)];
+            visited[e] = true;
+            while let Some((x, ci)) = stack.pop() {
+                let preds = self.pred_idx(x);
+                if ci < preds.len() {
+                    stack.push((x, ci + 1));
+                    let p = preds[ci];
+                    if !visited[p] {
+                        visited[p] = true;
+                        stack.push((p, 0));
+                    }
+                } else {
+                    post.push(x);
                 }
             }
-            post.push(addr);
         }
-        dfs(self, self.entry, &mut visited, &mut post);
         post.reverse();
-        post
+        let mut pos = vec![usize::MAX; n];
+        for (i, &b) in post.iter().enumerate() {
+            pos[b] = i;
+        }
+        for &e in &exits {
+            idom[e] = Some(e);
+        }
+
+        let intersect = |mut a: usize, mut b: usize, idom: &Vec<Option<usize>>| -> Option<usize> {
+            let mut guard = 0;
+            while a != b {
+                guard += 1;
+                if guard > 4 * n + 8 {
+                    return None;
+                }
+                // A root is its own immediate dominator, so walking up from
+                // one never terminates on its own — the outer guard never
+                // gets a chance to fire.
+                while pos[a] > pos[b] {
+                    let up = idom[a]?;
+                    if up == a {
+                        return None;
+                    }
+                    a = up;
+                }
+                while pos[b] > pos[a] {
+                    let up = idom[b]?;
+                    if up == b {
+                        return None;
+                    }
+                    b = up;
+                }
+            }
+            Some(a)
+        };
+
+        // The fixpoint is only guaranteed to settle on a reducible graph
+        // whose blocks all reach the exit. Optimised code has neither
+        // property (an infinite loop has no path to a `ret`), and there the
+        // fallback inside `intersect` can flip an entry back and forth
+        // forever. Cap the rounds: a partial dominator tree structures a
+        // little worse, a hang structures nothing at all.
+        let mut rounds = 0;
+        let mut changed = true;
+        while changed {
+            rounds += 1;
+            if rounds > 2 * n + 16 {
+                break;
+            }
+            changed = false;
+            for &b in post.iter() {
+                if exits.contains(&b) {
+                    continue;
+                }
+                let mut new: Option<usize> = None;
+                for s in self.succ_idx(b) {
+                    if pos[s] == usize::MAX || idom[s].is_none() {
+                        continue;
+                    }
+                    new = Some(match new {
+                        None => s,
+                        Some(cur) => match intersect(cur, s, &idom) {
+                            Some(x) => x,
+                            None => cur,
+                        },
+                    });
+                }
+                if let Some(ni) = new {
+                    if idom[b] != Some(ni) {
+                        idom[b] = Some(ni);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        idom
     }
 
-    fn dominates(idom: &HashMap<u64, u64>, a: u64, mut b: u64) -> bool {
+    pub fn dominates(idom: &[Option<usize>], a: usize, mut b: usize) -> bool {
+        let mut guard = 0;
         loop {
             if a == b {
                 return true;
             }
-            let next = match idom.get(&b) {
-                Some(&n) => n,
-                None => return false,
-            };
-            if next == b {
+            guard += 1;
+            if guard > idom.len() + 4 {
                 return false;
             }
-            b = next;
+            match idom[b] {
+                Some(n) if n != b => b = n,
+                _ => return false,
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------ structuring
+
+pub struct Loop {
+    pub header: usize,
+    pub body: HashSet<usize>,
+    pub latches: Vec<usize>,
+    pub follow: Option<usize>,
+}
+
+pub struct Structurer<'a> {
+    cfg: &'a Cfg,
+    instrs: &'a [LiftedInsn],
+    #[allow(dead_code)]
+    idom: Vec<Option<usize>>,
+    ipdom: Vec<Option<usize>>,
+    loops: HashMap<usize, Loop>,
+    emitted: HashSet<usize>,
+    /// second pass: emit a label in front of every block something jumps to
+    label_pass: bool,
+    pub goto_targets: HashSet<u64>,
+}
+
+impl<'a> Structurer<'a> {
+    pub fn new(cfg: &'a Cfg, instrs: &'a [LiftedInsn]) -> Structurer<'a> {
+        let idom = cfg.dominators();
+        let ipdom = cfg.post_dominators();
+        let loops = find_loops(cfg, &idom);
+        Structurer {
+            cfg,
+            instrs,
+            idom,
+            ipdom,
+            loops,
+            emitted: HashSet::new(),
+            label_pass: false,
+            goto_targets: HashSet::new(),
         }
     }
 
-    /// Renders structured (best-effort) pseudocode for the whole function.
-    pub fn render(&self) -> String {
-        let idom = self.dominators();
-        // back edges: succ (n -> h) where h dominates n
-        let mut headers: BTreeSet<u64> = BTreeSet::new();
-        for b in self.blocks.values() {
-            for &s in &b.succs {
-                if Self::dominates(&idom, s, b.addr) {
-                    headers.insert(s);
-                }
-            }
-        }
+    pub fn run(&mut self) -> Vec<CNode> {
+        // Two passes: the first discovers which addresses are jumped to,
+        // the second emits the matching labels. A `goto` without a label is
+        // exactly the defect that made the original output uncompilable,
+        // and the targets are not known until the walk is finished.
+        self.walk();
+        self.emitted.clear();
+        self.label_pass = true;
+        self.walk()
+    }
 
-        let mut out = String::new();
-        let ret_ty = if self.is_void { "void" } else { "int" };
-        let params = if self.param_count == 0 {
-            "void".to_string()
-        } else {
-            (1..=self.param_count)
-                .map(|i| format!("int a{}", i))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        out.push_str(&format!("{} {}({})\n{{\n", ret_ty, self.name, params));
-        let mut visited: BTreeSet<u64> = BTreeSet::new();
-        self.emit_region(self.entry, None, 1, &headers, &idom, &mut visited, &mut out);
-        out.push_str("}\n");
+    fn walk(&mut self) -> Vec<CNode> {
+        let mut out = Vec::new();
+        if self.cfg.blocks.is_empty() {
+            return out;
+        }
+        self.emit_seq(Some(self.cfg.entry), None, &mut Vec::new(), &mut out);
+
+        // Anything the structured walk never reached still has to appear,
+        // or code would silently vanish from the output — the failure
+        // mode the old `clamp` rendering had.
+        let mut leftovers: Vec<usize> =
+            (0..self.cfg.blocks.len()).filter(|b| !self.emitted.contains(b)).collect();
+        leftovers.sort_by_key(|&b| self.cfg.blocks[b].addr);
+        for b in leftovers {
+            if self.emitted.contains(&b) {
+                continue;
+            }
+            let addr = self.cfg.blocks[b].addr;
+            self.goto_targets.insert(addr);
+            if !self.label_pass {
+                out.push(CNode::Label(addr));
+            }
+            self.emit_seq(Some(b), None, &mut Vec::new(), &mut out);
+        }
         out
     }
 
-    /// Emits straight-line/structured code starting at `start`, stopping
-    /// once it reaches `stop` (exclusive) or runs out of natural flow.
-    fn emit_region(
-        &self,
-        start: u64,
-        stop: Option<u64>,
-        indent: usize,
-        headers: &BTreeSet<u64>,
-        idom: &HashMap<u64, u64>,
-        visited: &mut BTreeSet<u64>,
-        out: &mut String,
+    fn block_stmts(&self, b: usize) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for &ix in &self.cfg.blocks[b].instrs {
+            for st in &self.instrs[ix].stmts {
+                match st {
+                    Stmt::Nop | Stmt::If { .. } | Stmt::Goto(_) => {}
+                    Stmt::Assign { dst, .. } if is_frame_reg(dst) => {}
+                    other => out.push(other.clone()),
+                }
+            }
+        }
+        out
+    }
+
+    fn emit_seq(
+        &mut self,
+        start: Option<usize>,
+        stop: Option<usize>,
+        loop_stack: &mut Vec<(usize, Option<usize>)>,
+        out: &mut Vec<CNode>,
     ) {
-        let pad = "    ".repeat(indent);
-        let mut cur = Some(start);
-        while let Some(addr) = cur {
-            if Some(addr) == stop {
+        let mut cur = start;
+        loop {
+            let Some(b) = cur else { return };
+            if Some(b) == stop {
                 return;
             }
-            if !self.blocks.contains_key(&addr) || visited.contains(&addr) {
-                if visited.contains(&addr) {
-                    out.push_str(&format!("{}goto L{:x}; // already emitted (loop/merge)\n", pad, addr));
+            // a jump back into an enclosing loop
+            if let Some(&(h, follow)) = loop_stack.last() {
+                if b == h {
+                    out.push(CNode::Continue);
+                    return;
                 }
+                if Some(b) == follow && stop != Some(b) {
+                    out.push(CNode::Break);
+                    return;
+                }
+            }
+            if self.emitted.contains(&b) {
+                let addr = self.cfg.blocks[b].addr;
+                self.goto_targets.insert(addr);
+                out.push(CNode::Goto(addr));
                 return;
             }
-            visited.insert(addr);
-            let block = &self.blocks[&addr];
+            self.emitted.insert(b);
+            if self.label_pass && self.goto_targets.contains(&self.cfg.blocks[b].addr) {
+                out.push(CNode::Label(self.cfg.blocks[b].addr));
+            }
 
-            // WHILE loop: this block is a loop header with a conditional branch.
-            if headers.contains(&addr) && block.is_cond && block.succs.len() == 2 {
-                let (true_t, false_t) = (block.succs[0], block.succs[1]);
-                let inside = if Self::dominates(idom, addr, true_t) && self.leads_back_to(true_t, addr, headers) {
-                    Some((true_t, false_t, true))
-                } else if Self::dominates(idom, addr, false_t) && self.leads_back_to(false_t, addr, headers) {
-                    Some((false_t, true_t, false))
+            // ---- loop ------------------------------------------------
+            if self.loops.contains_key(&b) {
+                let (body_nodes, follow) = self.emit_loop(b, loop_stack);
+                out.extend(body_nodes);
+                cur = follow;
+                continue;
+            }
+
+            // ---- conditional ------------------------------------------
+            if self.cfg.blocks[b].is_cond && self.cfg.blocks[b].succs.len() == 2 {
+                let stmts = self.block_stmts(b);
+                if !stmts.is_empty() {
+                    out.push(CNode::Stmts(stmts));
+                }
+                let cond = self.cfg.blocks[b].cond.clone().unwrap_or(Expr::Unknown("cond".into()));
+                let t = self.cfg.index[&self.cfg.blocks[b].succs[0]];
+                let f = self.cfg.index[&self.cfg.blocks[b].succs[1]];
+                // the merge point is the immediate post-dominator
+                let follow = self.ipdom[b].filter(|&p| p != b);
+
+                let mut then_ = Vec::new();
+                let mut else_ = Vec::new();
+                let (cond, tb, fb) = if Some(t) == follow {
+                    (cond.negated(), f, t)
                 } else {
-                    None
+                    (cond, t, f)
                 };
-                if let Some((body, exit, cond_true_enters)) = inside {
-                    self.emit_plain_instrs(block, &pad, out);
-                    let cond_text = self.cond_text(block, cond_true_enters);
-                    out.push_str(&format!("{}while ({}) {{\n", pad, cond_text));
-                    self.emit_region(body, Some(addr), indent + 1, headers, idom, visited, out);
-                    out.push_str(&format!("{}}}\n", pad));
-                    cur = Some(exit);
-                    continue;
+                self.emit_seq(Some(tb), follow.or(stop), loop_stack, &mut then_);
+                if Some(fb) != follow {
+                    self.emit_seq(Some(fb), follow.or(stop), loop_stack, &mut else_);
                 }
-            }
-
-            // IF / IF-ELSE structuring for simple diamonds.
-            if block.is_cond && block.succs.len() == 2 {
-                let (t, fth) = (block.succs[0], block.succs[1]);
-                let t_single = self.single_succ(t);
-                let f_single = self.single_succ(fth);
-
-                self.emit_plain_instrs(block, &pad, out);
-                let cond = self.cond_text(block, true);
-
-                if t_single == Some(fth) {
-                    // if(cond) falls straight to merge; else-body is `fth`
-                    out.push_str(&format!("{}if (!({})) {{\n", pad, cond));
-                    self.emit_region(fth, Some(t), indent + 1, headers, idom, visited, out);
-                    out.push_str(&format!("{}}}\n", pad));
-                    cur = Some(t);
-                    continue;
-                } else if f_single == Some(t) {
-                    out.push_str(&format!("{}if ({}) {{\n", pad, cond));
-                    self.emit_region(t, Some(fth), indent + 1, headers, idom, visited, out);
-                    out.push_str(&format!("{}}}\n", pad));
-                    cur = Some(fth);
-                    continue;
-                } else if let (Some(m1), Some(m2)) = (t_single, f_single) {
-                    if m1 == m2 {
-                        out.push_str(&format!("{}if ({}) {{\n", pad, cond));
-                        self.emit_region(t, Some(m1), indent + 1, headers, idom, visited, out);
-                        out.push_str(&format!("{}}} else {{\n", pad));
-                        self.emit_region(fth, Some(m1), indent + 1, headers, idom, visited, out);
-                        out.push_str(&format!("{}}}\n", pad));
-                        cur = Some(m1);
-                        continue;
-                    }
+                out.push(CNode::If { cond, then_, else_ });
+                cur = follow;
+                if follow.is_none() {
+                    return;
                 }
-                // fallback: unstructured goto form
-                out.push_str(&format!("{}if ({}) goto L{:x}; else goto L{:x};\n", pad, cond, t, fth));
-                cur = self.fallthrough_addr(fth);
-                let _ = self.fallthrough_addr(t); // keep for readability parity
                 continue;
             }
 
-            // plain block
-            self.emit_plain_instrs(block, &pad, out);
-            match block.succs.first() {
-                Some(&s) => cur = Some(s),
-                None => cur = None, // ret or end of function
+            // ---- straight-line ----------------------------------------
+            let stmts = self.block_stmts(b);
+            if !stmts.is_empty() {
+                out.push(CNode::Stmts(stmts));
+            }
+            if self.cfg.blocks[b].ends_return {
+                return;
+            }
+            cur = self.cfg.blocks[b].succs.first().and_then(|s| self.cfg.index.get(s).copied());
+            if cur.is_none() {
+                return;
             }
         }
     }
 
-    fn cond_text(&self, block: &Block, want_true_branch: bool) -> String {
-        // Walk the block's instructions in order, remembering the most
-        // recent Cmp seen; when we hit the stashed __cond__ marker (from
-        // the Jcc that follows it), pair them up. The Cmp and the marker
-        // live on two different machine instructions (cmp; jcc), so this
-        // has to span the whole block rather than one instruction's ops.
-        let mut last_cmp: Option<(String, String)> = None;
-        let mut cond_str = "cond".to_string();
-        'outer: for &ix in &block.instrs {
-            let ins = &self.instrs[ix];
-            for op in &ins.ops {
-                match op {
-                    Instr::Cmp { lhs, rhs, .. } => {
-                        last_cmp = Some((lhs.to_string(), rhs.to_string()));
-                    }
-                    Instr::Unknown { text } => {
-                        if let Some(c) = text.strip_prefix("__cond__") {
-                            if let Some((l, r)) = &last_cmp {
-                                let sym = match c {
-                                    "Eq" => "==", "Ne" => "!=", "Lt" => "<", "Le" => "<=",
-                                    "Gt" => ">", "Ge" => ">=", "Below" => "<u", "BelowEq" => "<=u",
-                                    "Above" => ">u", "AboveEq" => ">=u", other => other,
-                                };
-                                cond_str = format!("{} {} {}", l, sym, r);
-                            }
-                            break 'outer;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if want_true_branch {
-            cond_str
-        } else {
-            format!("!({})", cond_str)
-        }
-    }
+    fn emit_loop(
+        &mut self,
+        h: usize,
+        loop_stack: &mut Vec<(usize, Option<usize>)>,
+    ) -> (Vec<CNode>, Option<usize>) {
+        let (body_set, latches, follow) = {
+            let l = &self.loops[&h];
+            (l.body.clone(), l.latches.clone(), l.follow)
+        };
+        let mut out = Vec::new();
+        loop_stack.push((h, follow));
 
-    fn emit_plain_instrs(&self, block: &Block, pad: &str, out: &mut String) {
-        for &ix in &block.instrs {
-            let ins = &self.instrs[ix];
-            for op in &ins.ops {
-                match op {
-                    Instr::Nop => {}
-                    Instr::CBranch { .. } | Instr::Branch { .. } => {} // handled by structuring
-                    Instr::Unknown { text } if text.starts_with("__cond__") => {}
-                    Instr::Cmp { .. } => {} // condition text pulled separately
-                    Instr::Ret { .. } => {
-                        // IR always carries `rax` on Ret (lifter.rs can't
-                        // tell void from int at the single-instruction
-                        // level) -- use the whole-function signature
-                        // (detect_signature) to decide what to print.
-                        if self.is_void {
-                            out.push_str(&format!("{}return;\n", pad));
-                        } else {
-                            out.push_str(&format!("{}return rax;\n", pad));
-                        }
-                    }
-                    other => out.push_str(&format!("{}{};\n", pad, other)),
-                }
-            }
-        }
-    }
+        let hdr_stmts = self.block_stmts(h);
+        let hdr_cond = self.cfg.blocks[h].cond.clone();
+        let hdr_is_cond = self.cfg.blocks[h].is_cond && self.cfg.blocks[h].succs.len() == 2;
 
-    fn single_succ(&self, addr: u64) -> Option<u64> {
-        self.blocks.get(&addr).and_then(|b| {
-            if b.succs.len() == 1 {
-                Some(b.succs[0])
+        if hdr_is_cond {
+            let t = self.cfg.index[&self.cfg.blocks[h].succs[0]];
+            let f = self.cfg.index[&self.cfg.blocks[h].succs[1]];
+            let (entry, cond) = if body_set.contains(&t) && Some(f) == follow {
+                (t, hdr_cond.clone().unwrap())
+            } else if body_set.contains(&f) && Some(t) == follow {
+                (f, hdr_cond.clone().unwrap().negated())
+            } else if body_set.contains(&t) {
+                (t, hdr_cond.clone().unwrap())
             } else {
-                None
-            }
-        })
-    }
+                (f, hdr_cond.clone().unwrap().negated())
+            };
 
-    fn fallthrough_addr(&self, addr: u64) -> Option<u64> {
-        self.blocks.get(&addr).and_then(|b| b.succs.first().copied())
-    }
+            let mut body = Vec::new();
+            self.emit_seq(Some(entry), Some(h), loop_stack, &mut body);
 
-    /// True if starting at `from` we can reach `header` again by following
-    /// successors without leaving the natural loop (bounded DFS).
-    fn leads_back_to(&self, from: u64, header: u64, _headers: &BTreeSet<u64>) -> bool {
-        let mut seen = BTreeSet::new();
-        let mut stack = vec![from];
-        while let Some(a) = stack.pop() {
-            if a == header {
-                return true;
+            if hdr_stmts.is_empty() {
+                // clean `while (cond)`
+                out.push(CNode::While { cond, body });
+            } else {
+                // The header does real work, and that work has to run on
+                // every iteration including the first, so it cannot be
+                // hoisted above the loop the way the original did.
+                let mut inner = vec![CNode::Stmts(hdr_stmts)];
+                inner.push(CNode::If {
+                    cond: cond.negated(),
+                    then_: vec![CNode::Break],
+                    else_: vec![],
+                });
+                inner.extend(body);
+                out.push(CNode::Forever { body: inner });
             }
-            if !seen.insert(a) {
-                continue;
+        } else {
+            // header isn't the test: a do/while or an irreducible shape
+            let latch_cond = latches
+                .iter()
+                .find(|&&l| self.cfg.blocks[l].is_cond)
+                .and_then(|&l| self.cfg.blocks[l].cond.clone());
+            let mut body = Vec::new();
+            if !hdr_stmts.is_empty() {
+                body.push(CNode::Stmts(hdr_stmts));
             }
-            if let Some(b) = self.blocks.get(&a) {
-                for &s in &b.succs {
-                    stack.push(s);
+            let next = self.cfg.blocks[h].succs.first().and_then(|s| self.cfg.index.get(s).copied());
+            self.emit_seq(next, Some(h), loop_stack, &mut body);
+            match latch_cond {
+                Some(c) => out.push(CNode::DoWhile { body, cond: c }),
+                None => out.push(CNode::Forever { body }),
+            }
+        }
+
+        loop_stack.pop();
+        (out, follow)
+    }
+}
+
+fn is_frame_reg(e: &Expr) -> bool {
+    matches!(e, Expr::Reg(r) if r.full == "rsp" || r.full == "rbp")
+}
+
+fn find_loops(cfg: &Cfg, idom: &[Option<usize>]) -> HashMap<usize, Loop> {
+    let mut loops: HashMap<usize, Loop> = HashMap::new();
+    for b in 0..cfg.blocks.len() {
+        for s in cfg.succ_idx(b) {
+            if Cfg::dominates(idom, s, b) {
+                // back edge b -> s
+                let e = loops.entry(s).or_insert_with(|| Loop {
+                    header: s,
+                    body: HashSet::new(),
+                    latches: Vec::new(),
+                    follow: None,
+                });
+                e.latches.push(b);
+            }
+        }
+    }
+    // natural loop body: everything that reaches a latch without leaving
+    // through the header
+    for (&h, l) in loops.iter_mut() {
+        let mut body: HashSet<usize> = HashSet::new();
+        body.insert(h);
+        let mut stack: Vec<usize> = l.latches.clone();
+        while let Some(n) = stack.pop() {
+            if body.insert(n) {
+                for p in cfg.pred_idx(n) {
+                    if p != h {
+                        stack.push(p);
+                    }
                 }
             }
         }
-        false
+        l.body = body;
     }
+    // follow node: first successor of a body block that lies outside
+    let keys: Vec<usize> = loops.keys().copied().collect();
+    for h in keys {
+        let body = loops[&h].body.clone();
+        let mut cands: BTreeMap<u64, usize> = BTreeMap::new();
+        // prefer an exit straight out of the header (a `while` loop)
+        for s in cfg.succ_idx(h) {
+            if !body.contains(&s) {
+                cands.insert(cfg.blocks[s].addr, s);
+            }
+        }
+        if cands.is_empty() {
+            for &n in &body {
+                for s in cfg.succ_idx(n) {
+                    if !body.contains(&s) {
+                        cands.insert(cfg.blocks[s].addr, s);
+                    }
+                }
+            }
+        }
+        loops.get_mut(&h).unwrap().follow = cands.values().next().copied();
+    }
+    loops
 }
