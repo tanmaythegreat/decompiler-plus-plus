@@ -146,6 +146,14 @@ fn main() {
     let reloc_call_symbols = resolve_reloc_call_targets(&obj, &text);
     let globals = build_globals(&obj);
 
+    for f in &mut funcs {
+        if f.name.starts_with("sub_") || f.name == "?" {
+            if let Some(name) = call_symbols.get(&f.start) {
+                f.name = lifter::sanitize_name(name);
+            }
+        }
+    }
+
     let selected: Vec<&FuncRegion> = match &opts.only {
         Some(n) => funcs.iter().filter(|f| &f.name == n).collect(),
         None => funcs.iter().take(opts.max_funcs).collect(),

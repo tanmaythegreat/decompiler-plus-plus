@@ -239,6 +239,10 @@ fn packed_intrinsic(m: Mnemonic) -> Option<&'static str> {
         Mnemonic::Psrlq => "_mm_srli_epi64",
         Mnemonic::Psrldq => "_mm_bsrli_si128",
         Mnemonic::Pslldq => "_mm_bslli_si128",
+        Mnemonic::Pxor => "_mm_xor_si128",
+        Mnemonic::Psrad => "_mm_srai_epi32",
+        Mnemonic::Movd => "_mm_movd",
+        Mnemonic::Movq => "_mm_movq",
         Mnemonic::Movdqa | Mnemonic::Movdqu => "_mm_load_si128",
         _ => return None,
     })

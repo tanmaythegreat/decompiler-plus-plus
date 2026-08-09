@@ -62,6 +62,8 @@ struct Ui {
     string_filter: String,
     /// address the Memory pane is showing, independent of the code selection
     mem_focus: Option<u64>,
+    history: Vec<usize>,
+    history_idx: usize,
 }
 
 impl Ui {
@@ -88,6 +90,8 @@ impl Ui {
             xref_target: String::new(),
             string_filter: String::new(),
             mem_focus: None,
+            history: Vec::new(),
+            history_idx: 0,
         }
     }
 
@@ -315,7 +319,23 @@ fn main() {
     let mut win = window::Window::default().with_size(1620, 1000).with_label("decompiler++");
     win.set_color(BG);
 
-    let mut menubar = menu::MenuBar::new(0, 0, 1620, 26, None);
+    let mut menubar = menu::MenuBar::new(0, 0, 1200, 26, None);
+    let mut btn_start = button::Button::new(1200, 0, 80, 26, "▶ Start");
+    btn_start.set_color(PANEL2);
+    btn_start.set_label_color(FG);
+    btn_start.set_frame(FrameType::FlatBox);
+    let mut btn_step = button::Button::new(1280, 0, 80, 26, "Step");
+    btn_step.set_color(PANEL2);
+    btn_step.set_label_color(FG);
+    btn_step.set_frame(FrameType::FlatBox);
+    let mut btn_over = button::Button::new(1360, 0, 100, 26, "Step Over");
+    btn_over.set_color(PANEL2);
+    btn_over.set_label_color(FG);
+    btn_over.set_frame(FrameType::FlatBox);
+    let mut btn_cont = button::Button::new(1460, 0, 100, 26, "Continue");
+    btn_cont.set_color(PANEL2);
+    btn_cont.set_label_color(FG);
+    btn_cont.set_frame(FrameType::FlatBox);
     menubar.set_color(PANEL);
     menubar.set_text_color(FG);
     menubar.set_selection_color(ACCENT);
@@ -344,7 +364,7 @@ fn main() {
     let mut t_graph = tab_button(350, 28, 74, "Graph");
     let mut g_mode = tab_button(426, 28, 132, "Graph: assembly");
     g_mode.hide();
-    let mut code_view = text::TextDisplay::new(242, 56, 776, 632, None);
+    let mut code_view = text::TextEditor::new(242, 56, 776, 632, None);
     let code_buf = text::TextBuffer::default();
     let code_style = text::TextBuffer::default();
     code_view.set_buffer(code_buf.clone());
@@ -360,7 +380,7 @@ fn main() {
     centre.end();
 
     let right = pane(1020, 26, 600, 664, "Disassembly");
-    let mut asm_view = text::TextDisplay::new(1022, 48, 596, 640, None);
+    let mut asm_view = text::TextEditor::new(1022, 48, 596, 640, None);
     let asm_buf = text::TextBuffer::default();
     let asm_style = text::TextBuffer::default();
     asm_view.set_buffer(asm_buf.clone());
@@ -391,12 +411,13 @@ fn main() {
     }
     let mut detach = tab_button(x + 12, 694, 90, "Detach");
 
-    let mut lower_view = text::TextDisplay::new(2, 720, 1616, 226, None);
+    let mut lower_view = text::TextEditor::new(2, 720, 1616, 226, None);
     let lower_buf = text::TextBuffer::default();
     let lower_style = text::TextBuffer::default();
     lower_view.set_buffer(lower_buf.clone());
     lower_view.set_highlight_data(lower_style.clone(), code_styles());
     style_display(&mut lower_view);
+    lower_view.handle(|_, ev| is_readonly_event(ev));
 
     let mut entry = input::Input::new(2, 950, 1616, 24, None);
     entry.set_color(PANEL2);
@@ -457,15 +478,19 @@ fn main() {
             let vars: Vec<String> = (0..f.frame.vars.len()).map(|i| u.var_label(f, i)).collect();
             let fns: Vec<String> = p.funcs.iter().map(|g| u.fname(&g.name)).collect();
 
+            let pc = u.emu.as_ref().and_then(|e| e.pc);
+
             // pseudocode
             let (mut txt, mut sty) = (String::new(), String::new());
             for (addr, line) in &u.code {
                 let bp = addr.map_or(false, |a| u.breakpoints.contains(&a));
+                let is_pc = pc.is_some() && addr == &pc;
                 let gutter = match addr {
-                    Some(a) => format!("{} {:08x}  ", if bp { "*" } else { " " }, a),
+                    Some(a) => format!("{} {:08x}  ", if is_pc { ">" } else if bp { "*" } else { " " }, a),
                     None => " ".repeat(12),
                 };
-                sty.push_str(&(if bp { "H" } else { "G" }).repeat(gutter.len()));
+                let style_char = if is_pc { "C" } else if bp { "H" } else { "G" };
+                sty.push_str(&style_char.repeat(gutter.len()));
                 sty.push_str(&style_line(line, &vars, &fns));
                 sty.push('\n');
                 txt.push_str(&gutter);
@@ -480,9 +505,11 @@ fn main() {
             let (mut atxt, mut asty) = (String::new(), String::new());
             for (i, (a, t)) in u.asm.iter().enumerate() {
                 let bp = u.breakpoints.contains(a);
-                let head = format!("{} {:08x} ", if bp { "*" } else { " " }, a);
+                let is_pc = pc == Some(*a);
+                let head = format!("{} {:08x} ", if is_pc { ">" } else if bp { "*" } else { " " }, a);
                 let arrow = arrows.get(i).cloned().unwrap_or_else(|| "    ".into());
-                asty.push_str(&(if bp { "H" } else { "G" }).repeat(head.len()));
+                let style_char = if is_pc { "C" } else if bp { "H" } else { "G" };
+                asty.push_str(&style_char.repeat(head.len()));
                 asty.push_str(&"E".repeat(arrow.chars().count()));
                 asty.push_str(&style_asm(t));
                 asty.push('\n');
@@ -494,7 +521,6 @@ fn main() {
             asm_buf.set_text(&atxt);
             asm_style.set_text(&asty);
 
-            let pc = u.emu.as_ref().and_then(|e| e.pc);
             let focus = pc.or(u.sel_addr);
             scroll_to(&mut code_view, &u.code.iter().map(|(a, _)| *a).collect::<Vec<_>>(), focus);
             scroll_to(&mut asm_view, &u.asm.iter().map(|(a, _)| Some(*a)).collect::<Vec<_>>(), focus);
@@ -636,10 +662,7 @@ fn main() {
             {
                 let mut u = ui.borrow_mut();
                 u.rebuild();
-                if u.emu.is_none() {
-                    let e = u.prog.as_ref().map(|p| Emu::new(p, u.cur));
-                    u.emu = e;
-                }
+                // Removed automatic emulator start on file load
             }
             fn_list.clear();
             {
@@ -651,7 +674,11 @@ fn main() {
                         if !pat.is_empty() && !name.to_lowercase().contains(&pat) {
                             continue;
                         }
-                        fn_list.add(&format!("{}\t{:x}", name, f.addr));
+                        if name == "_start" {
+                            fn_list.add(&format!("@B@C4@{}\t{:x}", name, f.addr));
+                        } else {
+                            fn_list.add(&format!("{}\t{:x}", name, f.addr));
+                        }
                         if i == u.cur {
                             fn_list.select(fn_list.size());
                         }
@@ -899,6 +926,40 @@ fn main() {
             redraw();
         });
     }
+    {
+        let ui = ui.clone();
+        let reload = reload.clone();
+        menubar.add("&View/&Back\t", Shortcut::Alt | '[', menu::MenuFlag::Normal, move |_| {
+            let mut u = ui.borrow_mut();
+            if u.history_idx > 0 {
+                if u.history_idx == u.history.len() {
+                    let cur = u.cur;
+                    u.history.push(cur);
+                }
+                u.history_idx -= 1;
+                u.cur = u.history[u.history_idx];
+                u.sel_addr = None;
+                u.sel_var = None;
+                drop(u);
+                reload();
+            }
+        });
+    }
+    {
+        let ui = ui.clone();
+        let reload = reload.clone();
+        menubar.add("&View/&Forward\t", Shortcut::Alt | ']', menu::MenuFlag::Normal, move |_| {
+            let mut u = ui.borrow_mut();
+            if u.history_idx + 1 < u.history.len() {
+                u.history_idx += 1;
+                u.cur = u.history[u.history_idx];
+                u.sel_addr = None;
+                u.sel_var = None;
+                drop(u);
+                reload();
+            }
+        });
+    }
     for (label, kind) in [
         ("&View/Registers\t", Bottom::Registers),
         ("&View/Stack\t", Bottom::Stack),
@@ -992,6 +1053,33 @@ fn main() {
         );
     });
 
+    {
+        let r = restart.clone();
+        btn_start.set_callback(move |_| r());
+    }
+    {
+        let s = step.clone();
+        btn_step.set_callback(move |_| s());
+    }
+    {
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        btn_over.set_callback(move |_| {
+            {
+                let mut u = ui.borrow_mut();
+                let Ui { prog: Some(p), emu: Some(e), .. } = &mut *u else { return };
+                e.step_over(p);
+                let pc = e.pc;
+                u.sel_addr = pc;
+            }
+            redraw();
+        });
+    }
+    {
+        let c = cont.clone();
+        btn_cont.set_callback(move |_| c());
+    }
+
     // ------------------------------------------------------- context menus --
     let context: Rc<dyn Fn(i32, i32)> = {
         let (r, t, b, x) = (rename.clone(), retype.clone(), toggle_bp.clone(), xrefs.clone());
@@ -1026,6 +1114,7 @@ fn main() {
         let ui = ui.clone();
         let redraw = redraw.clone();
         let context = context.clone();
+        let reload = reload.clone();
         let mut view = view;
         view.handle(move |v, ev| match ev {
             Event::Push | Event::Released => {
@@ -1036,9 +1125,29 @@ fn main() {
                         if let Some((a, _)) = u.asm.get(row) {
                             u.sel_addr = Some(*a);
                         }
-                    } else if let Some((a, _)) = u.code.get(row) {
-                        u.sel_addr = *a;
+                    } else if let Some((a, line)) = u.code.get(row).cloned() {
+                        u.sel_addr = a;
                         u.sel_var = u.var_on_line(row);
+                        
+                        if ev == Event::Released && app::event_mouse_button() == app::MouseButton::Left {
+                            if let Some(p) = &u.prog {
+                                if let Some(target) = p.funcs.iter().position(|f| mentions(&line, &u.fname(&f.name))) {
+                                    if target != u.cur {
+                                        let cur = u.cur;
+                                        let idx = u.history_idx;
+                                        u.history.truncate(idx);
+                                        u.history.push(cur);
+                                        u.history_idx = u.history.len();
+                                        u.cur = target;
+                                        u.sel_addr = None;
+                                        u.sel_var = None;
+                                        drop(u);
+                                        reload();
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if ev == Event::Push && app::event_mouse_button() == app::MouseButton::Right {
@@ -1049,7 +1158,7 @@ fn main() {
                 redraw();
                 false
             }
-            _ => false,
+            _ => is_readonly_event(ev),
         });
     }
 
@@ -1061,7 +1170,11 @@ fn main() {
             let i = b.value();
             if i > 0 {
                 let name = b.text(i).unwrap_or_default();
-                let name = name.split('\t').next().unwrap_or("").to_string();
+                let mut name = name.split('\t').next().unwrap_or("");
+                if name.starts_with("@B@C4@") {
+                    name = &name[6..];
+                }
+                let name = name.to_string();
                 let mut u = ui.borrow_mut();
                 if let Some(p) = &u.prog {
                     if let Some(k) = p.funcs.iter().position(|f| u.fname(&f.name) == name) {
@@ -1251,17 +1364,52 @@ fn detach_panel(ui: &Rc<RefCell<Ui>>) {
     };
     let mut w = window::Window::default().with_size(760, 520).with_label(&title);
     w.set_color(PANEL);
-    let mut d = text::TextDisplay::new(0, 0, 760, 520, None);
+    let mut d = text::TextEditor::new(0, 0, 760, 520, None);
     let mut b = text::TextBuffer::default();
     b.set_text(&body);
     d.set_buffer(b);
     style_display(&mut d);
+    d.handle(|_, ev| is_readonly_event(ev));
     w.end();
     w.make_resizable(true);
     w.show();
     // FLTK keeps the window alive as long as it is shown; leaking the handle
     // here is what lets it outlive this call.
     std::mem::forget(w);
+}
+
+fn is_readonly_event(ev: Event) -> bool {
+    if ev == Event::KeyDown || ev == Event::Paste {
+        let state = app::event_state();
+        let key = app::event_key();
+        
+        // Allow select all / copy
+        if state.contains(Shortcut::Ctrl) && (key == Key::from_char('c') || key == Key::from_char('a')) {
+            return false;
+        }
+        
+        // Allow navigation keys
+        let is_nav = matches!(
+            key,
+            Key::Left | Key::Right | Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End
+        );
+        if is_nav || state.contains(Shortcut::Shift) {
+            return false;
+        }
+        
+        // Block printable characters
+        if let Some(c) = app::event_text().chars().next() {
+            if !c.is_control() && !state.contains(Shortcut::Ctrl) && !state.contains(Shortcut::Alt) {
+                return true;
+            }
+        }
+        
+        // Block other editing keys
+        if matches!(key, Key::BackSpace | Key::Delete | Key::Enter | Key::Tab) {
+            return true;
+        }
+    }
+    false
 }
 
 // ------------------------------------------------------------ Ui helpers ---
@@ -1279,7 +1427,7 @@ impl Ui {
 
         match self.bottom {
             Bottom::Registers => {
-                let Some(e) = &self.emu else { return (String::new(), String::new()) };
+                let Some(e) = &self.emu else { return ("Not running.\n".into(), "G".repeat(13)) };
                 for r in SHOWN_REGS {
                     let v = e.reg(r);
                     let note = e.classify(v, p).describe();
@@ -1294,13 +1442,32 @@ impl Ui {
             }
 
             Bottom::Stack => {
-                let Some(e) = &self.emu else { return (String::new(), String::new()) };
+                let Some(e) = &self.emu else { return ("Not running.\n".into(), "G".repeat(13)) };
                 let (sp, bp) = (e.reg("rsp"), e.reg("rbp"));
-                // frame slots are relative to the frame pointer; naming them
-                // is the whole point of having decompiled the function
+                
+                // Collect frame bases to color distinct frames
+                let mut frames = vec![bp];
+                let mut curr = bp;
+                for _ in 0..5 {
+                    if curr == 0 { break; }
+                    let next = e.read(curr, 8);
+                    if next == 0 || next == curr || next == 0xdeadbeefdeadbeef { break; }
+                    frames.push(next);
+                    curr = next;
+                }
+                
                 let slots = self.slot_names(f);
                 for i in 0..20u64 {
                     let a = sp.wrapping_add(i * 8);
+                    
+                    // Determine frame color
+                    let mut frame_style = 'A'; // default color
+                    for (fi, &fbase) in frames.iter().enumerate() {
+                        if a <= fbase {
+                            frame_style = if fi % 2 == 0 { 'B' } else { 'E' }; // toggle RED / BLUE
+                            break;
+                        }
+                    }
                     let v = e.read(a, 8);
                     let mark = if a == sp {
                         "rsp>"
@@ -1323,12 +1490,12 @@ impl Ui {
                         v,
                         e.classify(v, p).describe()
                     );
-                    put(&line, if a == sp || a == bp { 'E' } else { 'A' }, &mut t, &mut s);
+                    put(&line, frame_style, &mut t, &mut s);
                 }
             }
 
             Bottom::Memory => {
-                let Some(e) = &self.emu else { return (String::new(), String::new()) };
+                let Some(e) = &self.emu else { return ("Not running.\n".into(), "G".repeat(13)) };
                 let base = self.mem_focus.unwrap_or_else(|| e.reg("rsp")) & !0xf;
                 put(
                     &format!("{:#x}   {}", base, e.classify(base, p).describe()),
@@ -1349,7 +1516,7 @@ impl Ui {
             }
 
             Bottom::Vmmap => {
-                let Some(e) = &self.emu else { return (String::new(), String::new()) };
+                let Some(e) = &self.emu else { return ("Not running.\n".into(), "G".repeat(13)) };
                 put(
                     &format!("{:<18} {:<18} {:<5} {}", "START", "END", "PERM", "MAPPING"),
                     'G',
@@ -1464,12 +1631,16 @@ fn jump_arrows(asm: &[(u64, String)]) -> Vec<String> {
         let hex = tok.trim_end_matches('h');
         let Ok(target) = u64::from_str_radix(hex.trim_start_matches("0x"), 16) else { continue };
         let Some(&j) = index.get(&target) else { continue };
-        spans.push((i.min(j), i.max(j)));
+        spans.push((i, j));
     }
     // give each span its own column so overlapping jumps stay readable
     let mut lanes: Vec<Vec<(usize, usize)>> = Vec::new();
     for sp in spans {
-        match lanes.iter_mut().find(|l| l.iter().all(|o| sp.1 < o.0 || sp.0 > o.1)) {
+        match lanes.iter_mut().find(|l| l.iter().all(|o| {
+            let (min1, max1) = (sp.0.min(sp.1), sp.0.max(sp.1));
+            let (min2, max2) = (o.0.min(o.1), o.0.max(o.1));
+            max1 < min2 || min1 > max2
+        })) {
             Some(l) => l.push(sp),
             None => lanes.push(vec![sp]),
         }
@@ -1482,18 +1653,32 @@ fn jump_arrows(asm: &[(u64, String)]) -> Vec<String> {
     let mut out = vec![String::new(); asm.len()];
     for (row, cell) in out.iter_mut().enumerate() {
         let mut line = vec![' '; width];
+        let mut has_arrow = false;
+        let mut has_line = false;
         for (li, lane) in lanes.iter().enumerate() {
-            for (a, b) in lane {
-                if row == *a {
-                    line[li] = '┌';
-                } else if row == *b {
-                    line[li] = '└';
-                } else if row > *a && row < *b {
+            for &(src, tgt) in lane {
+                let min = src.min(tgt);
+                let max = src.max(tgt);
+                if row == src {
+                    if src < tgt {
+                        line[li] = '┌';
+                    } else {
+                        line[li] = '└';
+                    }
+                    has_line = true;
+                } else if row == tgt {
+                    if src < tgt {
+                        line[li] = '└';
+                    } else {
+                        line[li] = '┌';
+                    }
+                    has_arrow = true;
+                } else if row > min && row < max {
                     line[li] = '│';
                 }
             }
         }
-        let tail = if line.iter().any(|c| *c == '┌' || *c == '└') { "─▶ " } else { "   " };
+        let tail = if has_arrow { "─▶ " } else if has_line { "── " } else { "   " };
         *cell = format!("{}{}", line.into_iter().collect::<String>(), tail);
     }
     out
@@ -1623,7 +1808,7 @@ fn pane(x: i32, y: i32, w: i32, h: i32, title: &str) -> group::Group {
     g
 }
 
-fn style_display(d: &mut text::TextDisplay) {
+fn style_display(d: &mut text::TextEditor) {
     // a visible caret: without it there is no way to tell where the keyboard
     // is pointing, and every action that acts on "the current line" looks
     // like it does nothing
@@ -1642,14 +1827,14 @@ fn style_display(d: &mut text::TextDisplay) {
 /// Which buffer line a click landed on. Going through the widget's own
 /// coordinate mapping rather than dividing by a line height keeps this
 /// correct when the view is scrolled.
-fn row_at(v: &text::TextDisplay, y: i32) -> usize {
+fn row_at(v: &text::TextEditor, y: i32) -> usize {
     let pos = v.xy_to_position(v.x() + 4, y, text::PositionType::Character);
     v.count_lines(0, pos, true).max(0) as usize
 }
 
 /// Bring the line for `addr` into view. TextDisplay has no per-row background,
 /// so the current line is shown by moving the caret to it.
-fn scroll_to(v: &mut text::TextDisplay, addrs: &[Option<u64>], addr: Option<u64>) {
+fn scroll_to(v: &mut text::TextEditor, addrs: &[Option<u64>], addr: Option<u64>) {
     let Some(t) = addr else { return };
     let Some(row) = addrs.iter().position(|a| *a == Some(t)) else { return };
     let pos = v.skip_lines(0, row as i32, true);

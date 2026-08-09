@@ -884,6 +884,17 @@ pub fn analyze_bytes(path: &str, bytes: &[u8]) -> Result<Program, String> {
     let reloc_call_symbols = resolve_reloc_call_targets(&obj, &text);
     let globals = build_globals(&obj);
 
+    let entry_addr = obj.entry();
+    for f in &mut funcs {
+        if f.name.starts_with("sub_") || f.name == "?" {
+            if f.start == entry_addr {
+                f.name = "_start".to_string();
+            } else if let Some(name) = call_symbols.get(&f.start) {
+                f.name = lifter::sanitize_name(name);
+            }
+        }
+    }
+
     let selected: Vec<&FuncRegion> = funcs.iter().collect();
 
     // ---- pass 1: learn signatures of local functions -------------------

@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 pub const STACK_TOP: u64 = 0x7fff_ffff_f000;
 pub const HEAP_BASE: u64 = 0x0000_6000_0000_0000;
-const SENTINEL: u64 = 0xdead_beef_dead_beef;
+const SENTINEL: u64 = 0x7fff_f7a0_3b97;
 pub const ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 
 pub struct Emu {
@@ -139,7 +139,21 @@ impl Emu {
         });
         e.regions.sort_by_key(|r| r.start);
 
+        let arg0 = STACK_TOP - 0x1000;
+        let arg0_str = b"program\0";
+        for (i, &b) in arg0_str.iter().enumerate() {
+            e.mem.insert(arg0 + i as u64, b);
+        }
+
+        e.push(0); // envp NULL
+        e.push(0); // argv NULL
+        e.push(arg0); // argv[0]
+        e.push(1); // argc
+        let sp = e.reg("rsp");
+        e.regs.insert("rdi".into(), 1);
+        e.regs.insert("rsi".into(), sp + 8);
         e.push(SENTINEL);
+
         e.pc = prog.funcs.get(entry).map(|f| f.addr);
         e
     }
@@ -159,6 +173,9 @@ impl Emu {
     pub fn classify(&self, v: u64, prog: &Program) -> Kind {
         if v == 0 {
             return Kind::Zero;
+        }
+        if v == SENTINEL {
+            return Kind::Pointer { region: "[libc]".into(), extra: "<__libc_start_main+231>".into() };
         }
         // a value that is only a small number is not worth annotating
 
@@ -459,6 +476,28 @@ impl Emu {
                 self.heap_top = self.heap;
                 self.sync_heap();
                 p
+            }
+            "mmap" | "mmap64" => {
+                let len = a(1);
+                if len == 0 {
+                    return 0;
+                }
+                let p = (self.heap + 0xfff) & !0xfff;
+                self.heap = p + len;
+                self.heap_top = self.heap;
+                self.sync_heap();
+                p
+            }
+            "brk" => {
+                let addr = a(0);
+                if addr == 0 {
+                    self.heap_top
+                } else {
+                    self.heap_top = addr;
+                    self.heap = addr.max(self.heap);
+                    self.sync_heap();
+                    self.heap_top
+                }
             }
             "gets" | "fgets" => {
                 let Some(l) = self.read_line() else { return 0 };

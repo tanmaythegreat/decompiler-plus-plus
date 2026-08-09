@@ -22,7 +22,7 @@ CC           := gcc
 ARCH_FLAGS   :=
 COMMON_FLAGS := -fno-stack-protector -no-pie
 STRIP        := strip --strip-all
-ALL_VARIANTS := O0 O1 O2 O3 static stripped pie obj
+ALL_VARIANTS := O0 O1 O2 O3 static stripped static_stripped pie obj
 endif
 SRC         := testing.c
 BUILD_DIR   := bin
@@ -65,6 +65,7 @@ FLAGS.O2      := -O2
 FLAGS.O3      := -O3
 FLAGS.static  := -O0 -static
 FLAGS.stripped:= -O0
+FLAGS.static_stripped := -O0 -static
 FLAGS.pie     := -O0 -pie -fpie
 
 BINARIES := $(addprefix $(BUILD_DIR)/testing_,$(VARIANTS))
@@ -108,6 +109,11 @@ $(BUILD_DIR)/testing_static: $(SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/testing_stripped: $(SRC) | $(BUILD_DIR)
 	@echo "==> [stripped] $(CC) $(COMMON_FLAGS) $(FLAGS.stripped) -o $@ $(SRC), then strip"
 	$(CC) $(COMMON_FLAGS) $(FLAGS.stripped) -o $@ $(SRC)
+	$(STRIP) $@
+
+$(BUILD_DIR)/testing_static_stripped: $(SRC) | $(BUILD_DIR)
+	@echo "==> [static_stripped] $(CC) $(COMMON_FLAGS) $(FLAGS.static_stripped) -o $@ $(SRC), then strip"
+	$(CC) $(COMMON_FLAGS) $(FLAGS.static_stripped) -o $@ $(SRC)
 	$(STRIP) $@
 
 $(BUILD_DIR)/testing_O0: $(SRC) | $(BUILD_DIR)
