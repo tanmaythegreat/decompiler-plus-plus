@@ -12,7 +12,7 @@
 
 use crate::analysis::Program;
 use crate::ir::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const STACK_TOP: u64 = 0x7fff_ffff_f000;
 pub const HEAP_BASE: u64 = 0x0000_6000_0000_0000;
@@ -31,6 +31,48 @@ pub struct Emu {
     heap: u64,
     depth: u32,
     index: HashMap<u64, (usize, usize)>,
+    pub breakpoints: HashSet<u64>,
+    pub hit_breakpoint: Option<u64>,
+    /// text the emulated program reads from stdin
+    pub stdin: String,
+    stdin_pos: usize,
+    pub regions: Vec<Region>,
+    heap_top: u64,
+}
+
+/// One mapped range, for the memory map view and for saying what a value
+/// points at.
+#[derive(Clone)]
+pub struct Region {
+    pub start: u64,
+    pub end: u64,
+    pub name: String,
+    pub perm: &'static str,
+}
+
+/// What a 64-bit value looks like it is.
+pub enum Kind {
+    Zero,
+    Small(i64),
+    Pointer { region: String, extra: String },
+    Unknown,
+}
+
+impl Kind {
+    pub fn describe(&self) -> String {
+        match self {
+            Kind::Zero => String::new(),
+            Kind::Small(v) => format!("{}", v),
+            Kind::Pointer { region, extra } => {
+                if extra.is_empty() {
+                    format!("-> {}", region)
+                } else {
+                    format!("-> {}  {}", region, extra)
+                }
+            }
+            Kind::Unknown => String::new(),
+        }
+    }
 }
 
 pub const SHOWN_REGS: [&str; 16] = [
@@ -52,6 +94,12 @@ impl Emu {
             heap: HEAP_BASE,
             depth: 0,
             index: HashMap::new(),
+            breakpoints: HashSet::new(),
+            hit_breakpoint: None,
+            stdin: String::new(),
+            stdin_pos: 0,
+            regions: Vec::new(),
+            heap_top: HEAP_BASE,
         };
         for r in SHOWN_REGS {
             e.regs.insert(r.to_string(), 0);
@@ -69,9 +117,81 @@ impl Emu {
                 e.index.insert(ins.addr, (fi, ii));
             }
         }
+        for (name, base, data) in &prog.memory {
+            e.regions.push(Region {
+                start: *base,
+                end: base + data.len() as u64,
+                name: format!("{} [{}]", name, short_name(&prog.path)),
+                perm: if name == ".text" {
+                    "r-x"
+                } else if name.starts_with(".ro") {
+                    "r--"
+                } else {
+                    "rw-"
+                },
+            });
+        }
+        e.regions.push(Region {
+            start: STACK_TOP - 0x21000,
+            end: STACK_TOP + 0x1000,
+            name: "[stack]".into(),
+            perm: "rw-",
+        });
+        e.regions.push(Region {
+            start: HEAP_BASE,
+            end: HEAP_BASE,
+            name: "[heap]".into(),
+            perm: "rw-",
+        });
+        e.regions.sort_by_key(|r| r.start);
+
         e.push(SENTINEL);
         e.pc = prog.funcs.get(entry).map(|f| f.addr);
         e
+    }
+
+    fn sync_heap(&mut self) {
+        let top = self.heap;
+        if let Some(r) = self.regions.iter_mut().find(|r| r.name == "[heap]") {
+            r.end = top;
+        }
+    }
+
+    pub fn region_of(&self, a: u64) -> Option<&Region> {
+        self.regions.iter().find(|r| a >= r.start && a < r.end.max(r.start + 1))
+    }
+
+    /// pwndbg-style: say what a value actually is.
+    pub fn classify(&self, v: u64, prog: &Program) -> Kind {
+        if v == 0 {
+            return Kind::Zero;
+        }
+        // a value that is only a small number is not worth annotating
+
+        if let Some(f) = prog.funcs.iter().find(|f| f.addr == v) {
+            return Kind::Pointer { region: ".text".into(), extra: format!("<{}>", f.name) };
+        }
+        if let Some(n) = prog.symbols.get(&v) {
+            return Kind::Pointer { region: ".text".into(), extra: format!("<{}>", n) };
+        }
+        if let Some(r) = self.region_of(v) {
+            let s = self.cstr(v);
+            let printable = !s.is_empty()
+                && s.len() >= 2
+                && s.bytes().all(|b| (0x20..0x7f).contains(&b) || b == b'\n' || b == b'\t');
+            let extra = if printable {
+                let cut: String = s.chars().take(28).collect();
+                format!("\"{}\"", cut.escape_debug())
+            } else {
+                format!("{:#x}", self.read(v, 8))
+            };
+            return Kind::Pointer { region: r.name.clone(), extra };
+        }
+        let s = v as i64;
+        if (-1_000_000..1_000_000).contains(&s) {
+            return Kind::Small(s);
+        }
+        Kind::Unknown
     }
 
     /// Put a value in the register the ABI uses for argument `i`.
@@ -100,6 +220,20 @@ impl Emu {
             self.mem.insert(a.wrapping_add(i), ((v >> (8 * i)) & 0xff) as u8);
         }
     }
+    /// The next line the emulated program would read from stdin.
+    fn read_line(&mut self) -> Option<String> {
+        if self.stdin_pos >= self.stdin.len() {
+            return None;
+        }
+        let rest = &self.stdin[self.stdin_pos..];
+        let (line, adv) = match rest.find('\n') {
+            Some(i) => (rest[..i].to_string(), i + 1),
+            None => (rest.to_string(), rest.len()),
+        };
+        self.stdin_pos += adv;
+        Some(line)
+    }
+
     fn push(&mut self, v: u64) {
         let sp = self.reg("rsp").wrapping_sub(8);
         self.regs.insert("rsp".into(), sp);
@@ -328,8 +462,45 @@ impl Emu {
             "malloc" | "calloc" => {
                 let p = self.heap;
                 self.heap += a(0).max(32) + 32;
+                self.heap_top = self.heap;
+                self.sync_heap();
                 p
             }
+            "gets" | "fgets" => {
+                let Some(l) = self.read_line() else { return 0 };
+                let dst = a(0);
+                for (i, b) in l.bytes().enumerate() {
+                    self.write(dst + i as u64, 1, b as u64);
+                }
+                self.write(dst + l.len() as u64, 1, 0);
+                dst
+            }
+            "scanf" | "__isoc99_scanf" => {
+                let Some(l) = self.read_line() else { return 0 };
+                let fmt = self.cstr(a(0));
+                let mut n = 0;
+                let mut words = l.split_whitespace();
+                for (i, spec) in fmt.match_indices('%').enumerate() {
+                    let _ = spec;
+                    let Some(w) = words.next() else { break };
+                    let dst = a(i + 1);
+                    if fmt.contains("%s") {
+                        for (j, b) in w.bytes().enumerate() {
+                            self.write(dst + j as u64, 1, b as u64);
+                        }
+                        self.write(dst + w.len() as u64, 1, 0);
+                    } else {
+                        let v: i64 = w.parse().unwrap_or(0);
+                        self.write(dst, 4, v as u64);
+                    }
+                    n += 1;
+                }
+                n
+            }
+            "getchar" => match self.read_line() {
+                Some(l) => l.bytes().next().unwrap_or(b'\n') as u64,
+                None => u64::MAX,
+            },
             "free" => 0,
             "strlen" => self.cstr(a(0)).len() as u64,
             "strcpy" | "strcat" => {
@@ -544,10 +715,22 @@ impl Emu {
         self.steps += 1;
     }
 
+    /// Run until the program stops or a breakpoint is reached.
     pub fn run(&mut self, prog: &Program, budget: u64) {
-        for _ in 0..budget {
+        self.hit_breakpoint = None;
+        for i in 0..budget {
             if self.halted || self.pc.is_none() {
                 break;
+            }
+            // a breakpoint stops *before* the instruction executes, and not
+            // on the very first step or resuming would be impossible
+            if i > 0 {
+                if let Some(pc) = self.pc {
+                    if self.breakpoints.contains(&pc) {
+                        self.hit_breakpoint = Some(pc);
+                        return;
+                    }
+                }
             }
             let before = self.pc;
             self.exec(prog);
@@ -556,4 +739,18 @@ impl Emu {
             }
         }
     }
+
+    pub fn toggle_breakpoint(&mut self, a: u64) {
+        if !self.breakpoints.remove(&a) {
+            self.breakpoints.insert(a);
+        }
+    }
+
+    pub fn started(&self) -> bool {
+        self.steps > 0 || self.halted
+    }
+}
+
+fn short_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }

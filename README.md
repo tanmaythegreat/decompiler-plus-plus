@@ -7,10 +7,8 @@ cargo build --release                     # command line only
 cargo build --release --features gui      # command line + native viewer
 ```
 
-The viewer needs the usual X11 development packages on Linux
-(`libx11-dev libxext-dev libxft-dev libxinerama-dev libxcursor-dev
-libxrender-dev libxfixes-dev libpango1.0-dev libgl1-mesa-dev`, plus `cmake`
-and a C++ compiler). macOS and Windows need no extra packages.
+Per-platform instructions, including making a macOS `.app`, are in
+[BUILDING.md](BUILDING.md).
 
 ## Command line
 
@@ -41,13 +39,20 @@ Everything is keyed on address. Clicking a line of C selects the instruction
 that produced it, and the block that contains it; clicking an instruction or a
 graph node selects back the other way. The stepper drives all three at once.
 
+Actions live in the menu bar and in the right-click menu; the keys are the
+same in both.
+
 | key | action |
 | --- | --- |
-| F2 | rename the selected variable, or the function if no variable is selected |
+| F2 | rename the selected variable, or the function if none is selected |
 | F3 | change the type of the selected variable |
-| F5 | reset the stepper |
-| F7 / F8 | execute one instruction |
-| F9 | run to completion |
+| F4 | toggle a breakpoint on the selected line |
+| F5 | start, or restart, the program |
+| F7 | execute one instruction |
+| F9 | continue to the next breakpoint |
+| Ctrl+F | search the strings |
+| Shift+F12 | find references to what the caret is on |
+| Ctrl+T | show or hide the width-conversion casts |
 
 Renames and retypes are applied when the text is drawn, so they take effect
 immediately and never re-run the analysis. `Structs…` defines a structure
@@ -194,3 +199,38 @@ in `samples/`.
   whether the code used the `ss` or `sd` forms.
 * No switch or jump-table recovery; an indirect jump ends the block.
 * The viewer has no breakpoints, no memory search, and does not save renames.
+
+## Viewer detail
+
+**Registers and stack are annotated**, in the way pwndbg annotates them: every
+value is looked up in the memory map and reported as what it actually is — a
+pointer into `.text`, `.rodata`, the stack or the heap, a known symbol, a
+string (quoted, printable prefix), a small integer, or nothing recognisable.
+The stack pane additionally names each slot with the *variable the
+decompilation gave it*, so `rbp-0x18` reads as `a1` rather than as an offset.
+
+**The memory map** (`Map`) lists every mapped range with permissions, the way
+`vmmap` does, and highlights the one the program counter is in.
+
+**Strings** lists every string recovered from the image and filters as you
+type; `Ctrl+F` searches them.
+
+**Cross references** (`Shift+F12`) lists every place in the binary that calls,
+branches to, or mentions the thing under the caret.
+
+**The disassembly** is syntax-coloured and carries jump rails down the left,
+so a loop is visible as a shape rather than as a pair of addresses to compare.
+
+**The graph** shows either the instructions of each block or the pseudocode
+statements they produced — the `Graph:` button switches. Blocks can be dragged
+into whatever arrangement makes the function readable.
+
+**Breakpoints** are set with F4 or the right-click menu, marked in both the
+pseudocode and the disassembly gutters, and honoured by `Continue`.
+
+**The output pane accepts input**: type in the field at the bottom and press
+Enter to feed the emulated program's `stdin`, which `scanf`, `gets`, `fgets`
+and `getchar` read.
+
+Any bottom panel can be `Detach`ed into its own window, which can then be moved
+and resized independently.

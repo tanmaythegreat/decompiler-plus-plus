@@ -9,8 +9,9 @@
 
 use fltk::enums::{Align, Color, Event, Font, FrameType, Key, Shortcut};
 use fltk::prelude::*;
-use fltk::{app, browser, button, dialog, draw, frame, group, text, window};
+use fltk::{app, browser, button, dialog, draw, frame, group, input, menu, text, window};
 use mini_decompiler::analysis::{self, Analyzed, Program};
+use std::collections::HashSet;
 use mini_decompiler::cfg::Cfg;
 use mini_decompiler::emu::{Emu, SHOWN_REGS};
 use mini_decompiler::ir::{Field, StructDef, StructTable, Type};
@@ -32,6 +33,10 @@ const NUMC: Color = Color::from_rgb(0xf7, 0x8c, 0x6c);
 const STRC: Color = Color::from_rgb(0xc3, 0xe8, 0x8d);
 const VARC: Color = Color::from_rgb(0xff, 0xcb, 0x6b);
 const WARN: Color = Color::from_rgb(0xf0, 0x71, 0x78);
+const HEADER: Color = Color::from_rgb(0x2a, 0x2f, 0x3a);
+const SHADOW: Color = Color::from_rgb(0x10, 0x12, 0x16);
+const EDGE_T: Color = Color::from_rgb(0x7f, 0xbf, 0x8f);
+const EDGE_F: Color = Color::from_rgb(0xd0, 0x7f, 0x7f);
 
 struct Ui {
     prog: Option<Program>,
@@ -46,6 +51,15 @@ struct Ui {
     sel_addr: Option<u64>,
     sel_var: Option<usize>,
     emu: Option<Emu>,
+    bottom: Bottom,
+    breakpoints: HashSet<u64>,
+    graph_pseudo: bool,
+    /// blocks the user dragged, offset from the layout origin
+    node_pos: HashMap<u64, (i32, i32)>,
+    drag: Option<(u64, i32, i32)>,
+    xrefs: Vec<(String, u64, String)>,
+    xref_target: String,
+    string_filter: String,
 }
 
 impl Ui {
@@ -63,6 +77,14 @@ impl Ui {
             sel_addr: None,
             sel_var: None,
             emu: None,
+            bottom: Bottom::Registers,
+            breakpoints: HashSet::new(),
+            graph_pseudo: false,
+            node_pos: HashMap::new(),
+            drag: None,
+            xrefs: Vec::new(),
+            xref_target: String::new(),
+            string_filter: String::new(),
         }
     }
 
@@ -259,115 +281,133 @@ fn code_styles() -> Vec<text::StyleTableEntry> {
         mk(ACCENT, Font::Courier),
         mk(VARC, Font::Courier),
         mk(DIM, Font::CourierItalic),
+        mk(WARN, Font::CourierBold),
     ]
 }
 
-fn reg_styles() -> Vec<text::StyleTableEntry> {
-    let mk = |c: Color| text::StyleTableEntry { color: c, font: Font::Courier, size: 13 };
-    vec![mk(FG), mk(DIM), mk(WARN)]
+// ---------------------------------------------------------------- state ----
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Bottom {
+    Registers,
+    Stack,
+    Memory,
+    Vmmap,
+    Strings,
+    Xrefs,
+    Output,
 }
 
 fn main() {
-    let app = app::App::default();
-    app::background(0x16, 0x18, 0x1d);
+    let app = app::App::default().with_scheme(app::Scheme::Gtk);
+    app::background(0x14, 0x16, 0x1a);
+    app::background2(0x1b, 0x1e, 0x25);
     app::foreground(0xd7, 0xda, 0xe0);
-    app::background2(0x22, 0x26, 0x2f);
     app::set_font(Font::Courier);
     app::set_font_size(13);
+    app::set_frame_type(FrameType::FlatBox);
+    app::set_menu_linespacing(6);
 
     let ui = Rc::new(RefCell::new(Ui::new()));
 
-    let mut win = window::Window::default().with_size(1500, 950).with_label("decompiler++");
+    let mut win = window::Window::default().with_size(1620, 1000).with_label("decompiler++");
     win.set_color(BG);
 
-    // toolbar
-    let mut b_open = tool_button(6, 4, 130, "Open binary…");
-    let mut b_cast = tool_button(142, 4, 110, "Casts: on");
-    let mut b_struct = tool_button(258, 4, 100, "Structs…");
-    let mut b_rename = tool_button(364, 4, 120, "Rename F2");
-    let mut b_type = tool_button(490, 4, 110, "Type F3");
-    let mut b_reset = tool_button(606, 4, 90, "Reset F5");
-    let mut b_step = tool_button(702, 4, 100, "Step F7");
-    let mut b_run = tool_button(808, 4, 100, "Run F9");
-    // Button shortcuts fire regardless of which widget holds focus, which
-    // the window-level key handler alone does not guarantee.
-    b_rename.set_shortcut(Shortcut::from_key(Key::F2));
-    b_type.set_shortcut(Shortcut::from_key(Key::F3));
-    b_reset.set_shortcut(Shortcut::from_key(Key::F5));
-    b_step.set_shortcut(Shortcut::from_key(Key::F7));
-    b_run.set_shortcut(Shortcut::from_key(Key::F9));
-    let mut lbl_file = frame::Frame::new(920, 4, 570, 26, None);
-    lbl_file.set_label_color(DIM);
-    lbl_file.set_label_size(11);
-    lbl_file.set_align(Align::Inside | Align::Left);
+    let mut menubar = menu::MenuBar::new(0, 0, 1620, 26, None);
+    menubar.set_color(PANEL);
+    menubar.set_text_color(FG);
+    menubar.set_selection_color(ACCENT);
+    menubar.set_frame(FrameType::FlatBox);
+    menubar.set_text_size(12);
 
-    // panes
-    let left = pane(0, 34, 230, 656, "Functions");
-    let mut fn_list = browser::HoldBrowser::new(2, 56, 226, 632, None);
+    // ---- panes ------------------------------------------------------------
+    let body = group::Tile::new(0, 26, 1620, 664, None);
+
+    let left = pane(0, 26, 240, 664, "Functions");
+    let mut filter = input::Input::new(4, 46, 232, 22, None);
+    filter.set_tooltip("filter functions");
+    filter.set_color(PANEL2);
+    filter.set_text_color(FG);
+    filter.set_text_size(12);
+    filter.set_frame(FrameType::FlatBox);
+    let mut fn_list = browser::HoldBrowser::new(2, 74, 236, 612, None);
     fn_list.set_color(PANEL);
     fn_list.set_selection_color(HOT);
     fn_list.set_text_size(12);
     fn_list.set_frame(FrameType::FlatBox);
     left.end();
 
-    let centre = pane(230, 34, 760, 656, "");
-    let mut t_code = tool_button(234, 36, 110, "Pseudocode");
-    let mut t_graph = tool_button(348, 36, 80, "Graph");
-    t_code.set_color(HOT);
-    let mut code_view = text::TextDisplay::new(232, 66, 756, 622, None);
+    let centre = pane(240, 26, 780, 664, "");
+    let mut t_code = tab_button(244, 28, 104, "Pseudocode");
+    let mut t_graph = tab_button(350, 28, 74, "Graph");
+    let mut g_mode = tab_button(426, 28, 132, "Graph: assembly");
+    g_mode.hide();
+    let mut code_view = text::TextDisplay::new(242, 56, 776, 632, None);
     let code_buf = text::TextBuffer::default();
     let code_style = text::TextBuffer::default();
     code_view.set_buffer(code_buf.clone());
     code_view.set_highlight_data(code_style.clone(), code_styles());
     style_display(&mut code_view);
 
-    let mut graph_scroll = group::Scroll::new(232, 66, 756, 622, None);
+    let mut graph_scroll = group::Scroll::new(242, 56, 776, 632, None);
     graph_scroll.set_color(PANEL);
     graph_scroll.set_frame(FrameType::FlatBox);
-    let mut graph = frame::Frame::new(232, 66, 3000, 3000, None);
+    let mut graph = frame::Frame::new(242, 56, 4000, 4000, None);
     graph_scroll.end();
     graph_scroll.hide();
     centre.end();
 
-    let right = pane(990, 34, 510, 656, "Disassembly");
-    let mut asm_view = text::TextDisplay::new(992, 56, 506, 632, None);
+    let right = pane(1020, 26, 600, 664, "Disassembly");
+    let mut asm_view = text::TextDisplay::new(1022, 48, 596, 640, None);
     let asm_buf = text::TextBuffer::default();
     let asm_style = text::TextBuffer::default();
     asm_view.set_buffer(asm_buf.clone());
     asm_view.set_highlight_data(asm_style.clone(), code_styles());
     style_display(&mut asm_view);
     right.end();
+    body.end();
 
-    let p_regs = pane(0, 690, 380, 260, "Registers");
-    let mut regs_view = text::TextDisplay::new(2, 712, 376, 236, None);
-    let regs_buf = text::TextBuffer::default();
-    let regs_style = text::TextBuffer::default();
-    regs_view.set_buffer(regs_buf.clone());
-    regs_view.set_highlight_data(regs_style.clone(), reg_styles());
-    style_display(&mut regs_view);
-    p_regs.end();
+    // ---- bottom -----------------------------------------------------------
+    let mut lower = group::Group::new(0, 690, 1620, 288, None);
+    lower.set_color(PANEL);
+    lower.set_frame(FrameType::FlatBox);
+    let names = [
+        ("Registers", Bottom::Registers),
+        ("Stack", Bottom::Stack),
+        ("Memory", Bottom::Memory),
+        ("Map", Bottom::Vmmap),
+        ("Strings", Bottom::Strings),
+        ("Xrefs", Bottom::Xrefs),
+        ("Output", Bottom::Output),
+    ];
+    let mut btabs: Vec<(button::Button, Bottom)> = Vec::new();
+    let mut x = 6;
+    for (label, kind) in names {
+        let w = label.len() as i32 * 8 + 22;
+        btabs.push((tab_button(x, 694, w, label), kind));
+        x += w + 2;
+    }
+    let mut detach = tab_button(x + 12, 694, 90, "Detach");
 
-    let p_stack = pane(380, 690, 340, 260, "Stack");
-    let mut stack_view = text::TextDisplay::new(382, 712, 336, 236, None);
-    let stack_buf = text::TextBuffer::default();
-    stack_view.set_buffer(stack_buf.clone());
-    style_display(&mut stack_view);
-    p_stack.end();
+    let mut lower_view = text::TextDisplay::new(2, 720, 1616, 226, None);
+    let lower_buf = text::TextBuffer::default();
+    let lower_style = text::TextBuffer::default();
+    lower_view.set_buffer(lower_buf.clone());
+    lower_view.set_highlight_data(lower_style.clone(), code_styles());
+    style_display(&mut lower_view);
 
-    let p_mem = pane(720, 690, 470, 260, "Memory");
-    let mut mem_view = text::TextDisplay::new(722, 712, 466, 236, None);
-    let mem_buf = text::TextBuffer::default();
-    mem_view.set_buffer(mem_buf.clone());
-    style_display(&mut mem_view);
-    p_mem.end();
+    let mut entry = input::Input::new(2, 950, 1616, 24, None);
+    entry.set_color(PANEL2);
+    entry.set_text_color(STRC);
+    entry.set_text_size(12);
+    entry.set_frame(FrameType::FlatBox);
+    lower.end();
 
-    let p_out = pane(1190, 690, 310, 260, "Output");
-    let mut out_view = text::TextDisplay::new(1192, 712, 306, 236, None);
-    let out_buf = text::TextBuffer::default();
-    out_view.set_buffer(out_buf.clone());
-    style_display(&mut out_view);
-    out_view.set_text_color(STRC);
-    p_out.end();
+    let mut status = frame::Frame::new(0, 978, 1620, 22, None);
+    status.set_label_color(DIM);
+    status.set_label_size(11);
+    status.set_align(Align::Inside | Align::Left);
+    status.set_frame(FrameType::FlatBox);
+    status.set_color(PANEL2);
 
     win.end();
     win.make_resizable(true);
@@ -376,70 +416,75 @@ fn main() {
     // ---------------------------------------------------------------- paint --
     let redraw: Rc<dyn Fn()> = {
         let ui = ui.clone();
-        let (code_buf, code_style) = (code_buf.clone(), code_style.clone());
-        let (asm_buf, asm_style) = (asm_buf.clone(), asm_style.clone());
-        let (regs_buf, regs_style) = (regs_buf.clone(), regs_style.clone());
-        let stack_buf = stack_buf.clone();
-        let mem_buf = mem_buf.clone();
-        let out_buf = out_buf.clone();
-        let code_view = code_view.clone();
-        let asm_view = asm_view.clone();
+        let bufs = (
+            code_buf.clone(),
+            code_style.clone(),
+            asm_buf.clone(),
+            asm_style.clone(),
+            lower_buf.clone(),
+            lower_style.clone(),
+        );
+        let views = (code_view.clone(), asm_view.clone(), lower_view.clone());
         let graph = graph.clone();
-        let lbl_file = lbl_file.clone();
+        let status = status.clone();
+        let entry = entry.clone();
+        let btabs: Vec<(button::Button, Bottom)> = btabs.clone();
         Rc::new(move || {
-            // FLTK handles are cheap references to the same widget; cloning
-            // here is what lets this be an `Fn` closure that can be shared
-            // by every callback.
-            let (mut code_buf, mut code_style) = (code_buf.clone(), code_style.clone());
-            let (mut asm_buf, mut asm_style) = (asm_buf.clone(), asm_style.clone());
-            let (mut regs_buf, mut regs_style) = (regs_buf.clone(), regs_style.clone());
-            let mut stack_buf = stack_buf.clone();
-            let mut mem_buf = mem_buf.clone();
-            let mut out_buf = out_buf.clone();
-            let mut code_view = code_view.clone();
-            let mut asm_view = asm_view.clone();
+            let (mut code_buf, mut code_style, mut asm_buf, mut asm_style, mut low_buf, mut low_style) =
+                (bufs.0.clone(), bufs.1.clone(), bufs.2.clone(), bufs.3.clone(), bufs.4.clone(), bufs.5.clone());
+            let (mut code_view, mut asm_view, mut low_view) =
+                (views.0.clone(), views.1.clone(), views.2.clone());
             let mut graph = graph.clone();
-            let mut lbl_file = lbl_file.clone();
+            let mut status = status.clone();
+            let mut entry = entry.clone();
 
             let u = ui.borrow();
-            let Some(p) = &u.prog else { return };
-            lbl_file.set_label(&format!(
-                "{}   {} functions   .text {:#x}..{:#x}",
-                p.path,
-                p.funcs.len(),
-                p.text_range.0,
-                p.text_range.1
-            ));
+            for (b, kind) in &btabs {
+                let mut b = b.clone();
+                b.set_color(if *kind == u.bottom { HOT } else { PANEL2 });
+            }
+            entry.set_readonly(u.bottom != Bottom::Output);
+
+            let Some(p) = &u.prog else {
+                status.set_label("  no file loaded — File ▸ Open");
+                return;
+            };
             let Some(f) = u.func() else { return };
 
             let vars: Vec<String> = (0..f.frame.vars.len()).map(|i| u.var_label(f, i)).collect();
             let fns: Vec<String> = p.funcs.iter().map(|g| u.fname(&g.name)).collect();
 
-            let mut txt = String::new();
-            let mut sty = String::new();
+            // pseudocode
+            let (mut txt, mut sty) = (String::new(), String::new());
             for (addr, line) in &u.code {
-                let prefix = match addr {
-                    Some(a) => format!("{:08x}  ", a),
-                    None => " ".repeat(10),
+                let bp = addr.map_or(false, |a| u.breakpoints.contains(&a));
+                let gutter = match addr {
+                    Some(a) => format!("{} {:08x}  ", if bp { "*" } else { " " }, a),
+                    None => " ".repeat(12),
                 };
-                sty.push_str(&"G".repeat(prefix.len()));
+                sty.push_str(&(if bp { "H" } else { "G" }).repeat(gutter.len()));
                 sty.push_str(&style_line(line, &vars, &fns));
                 sty.push('\n');
-                txt.push_str(&prefix);
+                txt.push_str(&gutter);
                 txt.push_str(line);
                 txt.push('\n');
             }
             code_buf.set_text(&txt);
             code_style.set_text(&sty);
 
-            let mut atxt = String::new();
-            let mut asty = String::new();
-            for (a, t) in &u.asm {
-                let head = format!("{:08x}  ", a);
-                asty.push_str(&"G".repeat(head.len()));
-                asty.push_str(&"A".repeat(t.len()));
+            // disassembly, with breakpoint marks and jump arrows
+            let arrows = jump_arrows(&u.asm);
+            let (mut atxt, mut asty) = (String::new(), String::new());
+            for (i, (a, t)) in u.asm.iter().enumerate() {
+                let bp = u.breakpoints.contains(a);
+                let head = format!("{} {:08x} ", if bp { "*" } else { " " }, a);
+                let arrow = arrows.get(i).cloned().unwrap_or_else(|| "    ".into());
+                asty.push_str(&(if bp { "H" } else { "G" }).repeat(head.len()));
+                asty.push_str(&"E".repeat(arrow.chars().count()));
+                asty.push_str(&style_asm(t));
                 asty.push('\n');
                 atxt.push_str(&head);
+                atxt.push_str(&arrow);
                 atxt.push_str(t);
                 atxt.push('\n');
             }
@@ -449,69 +494,33 @@ fn main() {
             let pc = u.emu.as_ref().and_then(|e| e.pc);
             let focus = pc.or(u.sel_addr);
             scroll_to(&mut code_view, &u.code.iter().map(|(a, _)| *a).collect::<Vec<_>>(), focus);
-            scroll_to(
-                &mut asm_view,
-                &u.asm.iter().map(|(a, _)| Some(*a)).collect::<Vec<_>>(),
-                focus,
-            );
+            scroll_to(&mut asm_view, &u.asm.iter().map(|(a, _)| Some(*a)).collect::<Vec<_>>(), focus);
 
-            if let Some(e) = &u.emu {
-                let mut rt = String::new();
-                let mut rs = String::new();
-                for pair in SHOWN_REGS.chunks(2) {
-                    for r in pair {
-                        let name = format!("{:<4} ", r);
-                        let val = format!("{:016x}   ", e.reg(r));
-                        rs.push_str(&"B".repeat(name.len()));
-                        rs.push_str(&(if e.changed(r) { "C" } else { "A" }).repeat(val.len()));
-                        rt.push_str(&name);
-                        rt.push_str(&val);
-                    }
-                    rt.push('\n');
-                    rs.push('\n');
-                }
-                let tail = format!(
-                    "\nrip  {}\nsteps {}   {}",
-                    e.pc.map(|v| format!("{:016x}", v)).unwrap_or_else(|| "--".into()),
-                    e.steps,
-                    e.reason
-                );
-                rs.push_str(&"A".repeat(tail.len()));
-                rt.push_str(&tail);
-                regs_buf.set_text(&rt);
-                regs_style.set_text(&rs);
-
-                let (sp, bp) = (e.reg("rsp"), e.reg("rbp"));
-                let mut st = String::new();
-                for i in 0..14u64 {
-                    let a = sp.wrapping_add(i * 8);
-                    let mark = if i == 0 {
-                        "rsp>"
-                    } else if a == bp {
-                        "rbp>"
-                    } else {
-                        "    "
-                    };
-                    st.push_str(&format!("{} {:012x}  {:016x}\n", mark, a, e.read(a, 8)));
-                }
-                stack_buf.set_text(&st);
-
-                let base = sp & !0xf;
-                let mut mt = String::new();
-                for r in 0..13u64 {
-                    let a = base.wrapping_add(r * 16);
-                    let mut h = String::new();
-                    let mut c = String::new();
-                    for col in 0..16u64 {
-                        let b = e.read(a + col, 1) as u8;
-                        h.push_str(&format!("{:02x} ", b));
-                        c.push(if (0x20..0x7f).contains(&b) { b as char } else { '.' });
-                    }
-                    mt.push_str(&format!("{:012x}  {}{}\n", a, h, c));
-                }
-                mem_buf.set_text(&mt);
-                out_buf.set_text(if e.out.is_empty() { "(no output yet)" } else { &e.out });
+            // bottom panel
+            let (lt, ls) = u.bottom_text(p, f);
+            low_buf.set_text(&lt);
+            low_style.set_text(&ls);
+            if u.bottom == Bottom::Output {
+                low_view.set_insert_position(low_buf.length());
+                low_view.show_insert_position();
             }
+
+            let st = match &u.emu {
+                Some(e) if e.halted => format!("  stopped — {}   {} steps", e.reason, e.steps),
+                Some(e) if e.hit_breakpoint.is_some() => format!(
+                    "  breakpoint at {:#x}   {} steps",
+                    e.hit_breakpoint.unwrap(),
+                    e.steps
+                ),
+                Some(e) if e.started() => format!("  running   pc {:#x}   {} steps", e.pc.unwrap_or(0), e.steps),
+                _ => format!(
+                    "  {}   {} functions   {} strings   F2 rename · F3 type · F4 breakpoint · Shift+F12 xrefs",
+                    short(&p.path),
+                    p.funcs.len(),
+                    p.strings.len()
+                ),
+            };
+            status.set_label(&st);
             graph.redraw();
         })
     };
@@ -524,43 +533,46 @@ fn main() {
             draw::draw_rectf(w.x(), w.y(), w.w(), w.h());
             let u = ui.borrow();
             let Some(f) = u.func() else { return };
-            let boxes = graph_layout(f, w.x() + 20, w.y() + 20);
+            let boxes = u.graph_boxes(f, w.x() + 24, w.y() + 24);
             let pc = u.emu.as_ref().and_then(|e| e.pc);
 
             for b in &boxes {
                 for (i, s) in b.succs.iter().enumerate() {
                     let Some(t) = boxes.iter().find(|x| x.addr == *s) else { continue };
                     draw::set_draw_color(if b.succs.len() == 2 {
-                        if i == 0 {
-                            Color::from_rgb(0x7f, 0xbf, 0x7f)
-                        } else {
-                            Color::from_rgb(0xbf, 0x7f, 0x7f)
-                        }
+                        if i == 0 { EDGE_T } else { EDGE_F }
                     } else {
                         DIM
                     });
-                    draw::draw_line(b.x + b.w / 2, b.y + b.h, t.x + t.w / 2, t.y - 2);
+                    draw::set_line_style(draw::LineStyle::Solid, 2);
+                    let (x1, y1) = (b.x + b.w / 2, b.y + b.h);
+                    let (x2, y2) = (t.x + t.w / 2, t.y);
+                    let mid = (y1 + y2) / 2;
+                    draw::draw_line(x1, y1, x1, mid);
+                    draw::draw_line(x1, mid, x2, mid);
+                    draw::draw_line(x2, mid, x2, y2 - 6);
+                    draw::draw_polygon(x2 - 4, y2 - 7, x2 + 4, y2 - 7, x2, y2);
+                    draw::set_line_style(draw::LineStyle::Solid, 1);
                 }
             }
-            draw::set_font(Font::Courier, 11);
             for b in &boxes {
                 let hot = u.sel_addr.map_or(false, |a| b.insns.contains(&a));
                 let is_pc = pc.map_or(false, |a| b.insns.contains(&a));
+                draw::set_draw_color(SHADOW);
+                draw::draw_rectf(b.x + 3, b.y + 3, b.w, b.h);
                 draw::set_draw_color(if is_pc { PCBG } else { PANEL2 });
                 draw::draw_rectf(b.x, b.y, b.w, b.h);
-                draw::set_draw_color(if is_pc {
-                    STRC
-                } else if hot {
-                    ACCENT
-                } else {
-                    LINE
-                });
+                draw::set_draw_color(if is_pc { STRC } else if hot { ACCENT } else { LINE });
                 draw::draw_rect(b.x, b.y, b.w, b.h);
+                draw::set_draw_color(HEADER);
+                draw::draw_rectf(b.x + 1, b.y + 1, b.w - 2, 18);
+                draw::set_font(Font::CourierBold, 11);
                 draw::set_draw_color(ACCENT);
-                draw::draw_text(&format!("{:#x}", b.addr), b.x + 8, b.y + 15);
-                draw::set_draw_color(FG);
+                draw::draw_text(&format!("{:#x}", b.addr), b.x + 8, b.y + 14);
+                draw::set_font(Font::Courier, 11);
                 for (i, t) in b.text.iter().enumerate() {
-                    draw::draw_text(t, b.x + 8, b.y + 15 + 13 * (i as i32 + 1));
+                    draw::set_draw_color(if u.graph_pseudo { FG } else { DIM });
+                    draw::draw_text(t, b.x + 8, b.y + 32 + 13 * i as i32);
                 }
             }
         });
@@ -568,149 +580,179 @@ fn main() {
     {
         let ui = ui.clone();
         let redraw = redraw.clone();
-        graph.handle(move |w, ev| {
-            if ev == Event::Push {
+        let mut scroll = graph_scroll.clone();
+        graph.handle(move |w, ev| match ev {
+            Event::Push => {
                 let (mx, my) = app::event_coords();
                 let hit = {
                     let u = ui.borrow();
                     u.func().and_then(|f| {
-                        graph_layout(f, w.x() + 20, w.y() + 20)
+                        u.graph_boxes(f, w.x() + 24, w.y() + 24)
                             .into_iter()
                             .find(|b| mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h)
-                            .and_then(|b| b.insns.first().copied())
                     })
                 };
-                if let Some(a) = hit {
-                    ui.borrow_mut().sel_addr = Some(a);
+                if let Some(b) = hit {
+                    let mut u = ui.borrow_mut();
+                    u.sel_addr = b.insns.first().copied();
+                    u.drag = Some((b.addr, mx - b.x, my - b.y));
+                    drop(u);
                     redraw();
                     return true;
                 }
+                false
             }
-            false
+            Event::Drag => {
+                let (mx, my) = app::event_coords();
+                let mut u = ui.borrow_mut();
+                if let Some((addr, dx, dy)) = u.drag {
+                    let base = (w.x() + 24, w.y() + 24);
+                    u.node_pos.insert(addr, (mx - dx - base.0, my - dy - base.1));
+                    drop(u);
+                    scroll.redraw();
+                    return true;
+                }
+                false
+            }
+            Event::Released => {
+                ui.borrow_mut().drag = None;
+                true
+            }
+            _ => false,
         });
     }
 
-    // ------------------------------------------------------------ callbacks --
+    // ------------------------------------------------------------- actions --
     let reload: Rc<dyn Fn()> = {
         let ui = ui.clone();
         let fn_list = fn_list.clone();
+        let filter = filter.clone();
         let redraw = redraw.clone();
         Rc::new(move || {
             let mut fn_list = fn_list.clone();
             {
                 let mut u = ui.borrow_mut();
                 u.rebuild();
-                let e = u.prog.as_ref().map(|p| Emu::new(p, u.cur));
-                u.emu = e;
+                if u.emu.is_none() {
+                    let e = u.prog.as_ref().map(|p| Emu::new(p, u.cur));
+                    u.emu = e;
+                }
             }
             fn_list.clear();
             {
                 let u = ui.borrow();
+                let pat = filter.value().to_lowercase();
                 if let Some(p) = &u.prog {
-                    for f in &p.funcs {
-                        fn_list.add(&format!("{}   @{:x}", u.fname(&f.name), f.addr));
+                    for (i, f) in p.funcs.iter().enumerate() {
+                        let name = u.fname(&f.name);
+                        if !pat.is_empty() && !name.to_lowercase().contains(&pat) {
+                            continue;
+                        }
+                        fn_list.add(&format!("{}\t{:x}", name, f.addr));
+                        if i == u.cur {
+                            fn_list.select(fn_list.size());
+                        }
                     }
-                    fn_list.select(u.cur as i32 + 1);
                 }
             }
             redraw();
         })
     };
 
-    {
+    let open_file: Rc<dyn Fn(Option<String>)> = {
         let ui = ui.clone();
         let reload = reload.clone();
-        b_open.set_callback(move |_| {
-            let mut c = dialog::NativeFileChooser::new(dialog::NativeFileChooserType::BrowseFile);
-            c.show();
-            let path = c.filename();
-            if path.as_os_str().is_empty() {
-                return;
-            }
-            match analysis::analyze_file(&path.to_string_lossy()) {
+        Rc::new(move |path: Option<String>| {
+            let path = match path {
+                Some(p) => p,
+                None => {
+                    let mut c =
+                        dialog::NativeFileChooser::new(dialog::NativeFileChooserType::BrowseFile);
+                    c.show();
+                    let f = c.filename();
+                    if f.as_os_str().is_empty() {
+                        return;
+                    }
+                    f.to_string_lossy().to_string()
+                }
+            };
+            match analysis::analyze_file(&path) {
                 Ok(p) => {
                     let mut u = ui.borrow_mut();
+                    u.cur = p.funcs.iter().position(|f| f.name == "main").unwrap_or(0);
                     u.prog = Some(p);
-                    u.cur = 0;
                     u.sel_addr = None;
                     u.sel_var = None;
+                    u.emu = None;
+                    u.node_pos.clear();
                 }
                 Err(e) => {
-                    dialog::alert_default(&e);
+                    dialog::alert_default(&format!("{}\n\nOnly ELF objects are supported.", e));
                     return;
                 }
             }
             reload();
-        });
-    }
+        })
+    };
 
-    {
-        let ui = ui.clone();
-        let reload = reload.clone();
-        fn_list.set_callback(move |b| {
-            let i = b.value();
-            if i > 0 {
-                let mut u = ui.borrow_mut();
-                u.cur = i as usize - 1;
-                u.sel_addr = None;
-                u.sel_var = None;
-                drop(u);
-                reload();
-            }
-        });
-    }
-
-    {
+    let restart: Rc<dyn Fn()> = {
         let ui = ui.clone();
         let redraw = redraw.clone();
-        b_cast.set_callback(move |b| {
+        Rc::new(move || {
             {
                 let mut u = ui.borrow_mut();
-                u.no_cast = !u.no_cast;
-                b.set_label(if u.no_cast { "Casts: off" } else { "Casts: on" });
-                u.rebuild();
+                let bps = u.breakpoints.clone();
+                let stdin = u.emu.as_ref().map(|e| e.stdin.clone()).unwrap_or_default();
+                let cur = u.cur;
+                if let Some(p) = &u.prog {
+                    let mut e = Emu::new(p, cur);
+                    e.breakpoints = bps.into_iter().collect();
+                    e.stdin = stdin;
+                    u.emu = Some(e);
+                }
+                u.sel_addr = u.emu.as_ref().and_then(|e| e.pc);
+                u.bottom = Bottom::Registers;
             }
             redraw();
-        });
-    }
+        })
+    };
 
-    {
+    let step: Rc<dyn Fn()> = {
         let ui = ui.clone();
         let redraw = redraw.clone();
-        code_view.handle(move |v, ev| {
-            if ev == Event::Released {
-                let row = row_at(v, app::event_y());
-                {
-                    let mut u = ui.borrow_mut();
-                    if let Some((addr, _)) = u.code.get(row) {
-                        u.sel_addr = *addr;
-                        u.sel_var = u.var_on_line(row);
-                    }
-                }
-                redraw();
+        Rc::new(move || {
+            {
+                let mut u = ui.borrow_mut();
+                let Ui { prog: Some(p), emu: Some(e), .. } = &mut *u else { return };
+                e.exec(p);
+                let pc = e.pc;
+                u.sel_addr = pc;
             }
-            false
-        });
-    }
-    {
+            redraw();
+        })
+    };
+
+    let cont: Rc<dyn Fn()> = {
         let ui = ui.clone();
         let redraw = redraw.clone();
-        asm_view.handle(move |v, ev| {
-            if ev == Event::Released {
-                let row = row_at(v, app::event_y());
-                {
-                    let mut u = ui.borrow_mut();
-                    if let Some((addr, _)) = u.asm.get(row) {
-                        u.sel_addr = Some(*addr);
-                    }
+        Rc::new(move || {
+            {
+                let mut u = ui.borrow_mut();
+                let bps = u.breakpoints.clone();
+                let Ui { prog: Some(p), emu: Some(e), .. } = &mut *u else { return };
+                e.breakpoints = bps.into_iter().collect();
+                e.run(p, 20_000_000);
+                let pc = e.pc;
+                u.sel_addr = pc;
+                if u.emu.as_ref().map_or(false, |e| !e.out.is_empty()) {
+                    u.bottom = Bottom::Output;
                 }
-                redraw();
             }
-            false
-        });
-    }
+            redraw();
+        })
+    };
 
-    let do_rename: Rc<dyn Fn()> = {
+    let rename: Rc<dyn Fn()> = {
         let ui = ui.clone();
         let reload = reload.clone();
         Rc::new(move || {
@@ -739,12 +781,8 @@ fn main() {
             reload();
         })
     };
-    {
-        let d = do_rename.clone();
-        b_rename.set_callback(move |_| d());
-    }
 
-    let do_type: Rc<dyn Fn()> = {
+    let retype: Rc<dyn Fn()> = {
         let ui = ui.clone();
         let reload = reload.clone();
         Rc::new(move || {
@@ -770,182 +808,692 @@ fn main() {
             reload();
         })
     };
-    {
-        let d = do_type.clone();
-        b_type.set_callback(move |_| d());
-    }
 
+    let toggle_bp: Rc<dyn Fn()> = {
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        Rc::new(move || {
+            {
+                let mut u = ui.borrow_mut();
+                let Some(a) = u.sel_addr else { return };
+                if !u.breakpoints.remove(&a) {
+                    u.breakpoints.insert(a);
+                }
+                let bps = u.breakpoints.clone();
+                if let Some(e) = &mut u.emu {
+                    e.breakpoints = bps.into_iter().collect();
+                }
+            }
+            redraw();
+        })
+    };
+
+    let xrefs: Rc<dyn Fn()> = {
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        Rc::new(move || {
+            {
+                let mut u = ui.borrow_mut();
+                let Some(p) = &u.prog else { return };
+                let (target, name) = match u.sel_addr {
+                    Some(a) => {
+                        let f = p.funcs.iter().find(|f| f.raw.iter().any(|i| i.addr == a));
+                        // a call site refers to its target, so prefer that
+                        let called = f
+                            .and_then(|f| f.raw.iter().find(|i| i.addr == a))
+                            .and_then(|i| i.targets.first().copied())
+                            .filter(|t| p.funcs.iter().any(|g| g.addr == *t));
+                        match called {
+                            Some(t) => (
+                                t,
+                                p.funcs.iter().find(|g| g.addr == t).map(|g| g.name.clone()).unwrap_or_default(),
+                            ),
+                            None => (u.func().map(|f| f.addr).unwrap_or(0), u.func().map(|f| f.name.clone()).unwrap_or_default()),
+                        }
+                    }
+                    None => (
+                        u.func().map(|f| f.addr).unwrap_or(0),
+                        u.func().map(|f| f.name.clone()).unwrap_or_default(),
+                    ),
+                };
+                u.xrefs = analysis::references_to(p, target, &name);
+                u.xref_target = format!("{} ({:#x})", name, target);
+                u.bottom = Bottom::Xrefs;
+            }
+            redraw();
+        })
+    };
+
+    let find_string: Rc<dyn Fn()> = {
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        Rc::new(move || {
+            let Some(q) = dialog::input_default("Search strings for", "") else { return };
+            {
+                let mut u = ui.borrow_mut();
+                u.string_filter = q.trim().to_lowercase();
+                u.bottom = Bottom::Strings;
+            }
+            redraw();
+        })
+    };
+
+    // ------------------------------------------------------------- menu bar --
+    {
+        let o = open_file.clone();
+        menubar.add("&File/&Open binary…\t", Shortcut::Ctrl | 'o', menu::MenuFlag::Normal, move |_| o(None));
+    }
+    menubar.add("&File/&Quit\t", Shortcut::Ctrl | 'q', menu::MenuFlag::Normal, |_| app::quit());
+    {
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        menubar.add("&View/&Casts\t", Shortcut::Ctrl | 't', menu::MenuFlag::Toggle, move |_| {
+            {
+                let mut u = ui.borrow_mut();
+                u.no_cast = !u.no_cast;
+                u.rebuild();
+            }
+            redraw();
+        });
+    }
+    for (label, kind) in [
+        ("&View/Registers\t", Bottom::Registers),
+        ("&View/Stack\t", Bottom::Stack),
+        ("&View/Memory map\t", Bottom::Vmmap),
+        ("&View/Strings\t", Bottom::Strings),
+        ("&View/Output\t", Bottom::Output),
+    ] {
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        menubar.add(label, Shortcut::None, menu::MenuFlag::Normal, move |_| {
+            ui.borrow_mut().bottom = kind;
+            redraw();
+        });
+    }
+    {
+        let f = find_string.clone();
+        menubar.add("&Search/&Strings…\t", Shortcut::Ctrl | 'f', menu::MenuFlag::Normal, move |_| f());
+    }
+    {
+        let x = xrefs.clone();
+        menubar.add(
+            "&Search/&References\t",
+            Shortcut::Shift | Key::F12,
+            menu::MenuFlag::Normal,
+            move |_| x(),
+        );
+    }
+    {
+        let r = rename.clone();
+        menubar.add("&Edit/&Rename\t", Shortcut::from_key(Key::F2), menu::MenuFlag::Normal, move |_| r());
+    }
+    {
+        let t = retype.clone();
+        menubar.add("&Edit/Change &type\t", Shortcut::from_key(Key::F3), menu::MenuFlag::Normal, move |_| t());
+    }
     {
         let ui = ui.clone();
         let reload = reload.clone();
-        b_struct.set_callback(move |_| {
-            let existing: Vec<String> =
-                ui.borrow().structs().defs.iter().map(|d| d.name.clone()).collect();
-            let prompt = format!(
-                "Existing: {}\nNew struct name:",
-                if existing.is_empty() { "none".to_string() } else { existing.join(", ") }
-            );
-            let Some(name) = dialog::input_default(&prompt, "my_struct") else { return };
-            let name = name.trim().to_string();
-            if !valid_identifier(&name) {
-                dialog::alert_default("not a valid identifier");
-                return;
-            }
-            let Some(body) =
-                dialog::input_default("Fields, semicolon separated: offset type name", "0 int x; 4 int y; 8 long tag")
-            else {
-                return;
-            };
-            match parse_struct(&name, &body) {
-                Some(d) => {
-                    let mut u = ui.borrow_mut();
-                    u.user_structs.retain(|x| x.name != d.name);
-                    u.user_structs.push(d);
-                }
-                None => {
-                    dialog::alert_default("could not parse the field list");
-                    return;
-                }
-            }
+        menubar.add("&Edit/&Structures…\t", Shortcut::None, menu::MenuFlag::Normal, move |_| {
+            define_struct(&ui);
             reload();
         });
     }
+    {
+        let r = restart.clone();
+        menubar.add("&Debug/&Start\t", Shortcut::from_key(Key::F5), menu::MenuFlag::Normal, move |_| r());
+    }
+    {
+        let s = step.clone();
+        menubar.add("&Debug/Ste&p\t", Shortcut::from_key(Key::F7), menu::MenuFlag::Normal, move |_| s());
+    }
+    {
+        let c = cont.clone();
+        menubar.add("&Debug/&Continue\t", Shortcut::from_key(Key::F9), menu::MenuFlag::Normal, move |_| c());
+    }
+    {
+        let b = toggle_bp.clone();
+        menubar.add(
+            "&Debug/Toggle &breakpoint\t",
+            Shortcut::from_key(Key::F4),
+            menu::MenuFlag::Normal,
+            move |_| b(),
+        );
+    }
+    menubar.add("&Help/&Keys\t", Shortcut::None, menu::MenuFlag::Normal, |_| {
+        dialog::message_default(
+            "F2 rename    F3 change type    F4 breakpoint\n\
+             F5 start     F7 step           F9 continue\n\
+             Ctrl+F strings    Shift+F12 references    Ctrl+T casts\n\n\
+             Right-click the code for the same actions.\n\
+             Drag graph blocks to rearrange them.",
+        );
+    });
 
-    let do_reset: Rc<dyn Fn()> = {
+    // ------------------------------------------------------- context menus --
+    let context: Rc<dyn Fn(i32, i32)> = {
+        let (r, t, b, x) = (rename.clone(), retype.clone(), toggle_bp.clone(), xrefs.clone());
         let ui = ui.clone();
         let redraw = redraw.clone();
-        Rc::new(move || {
-            {
-                let mut u = ui.borrow_mut();
-                let e = u.prog.as_ref().map(|p| Emu::new(p, u.cur));
-                u.emu = e;
-                u.sel_addr = u.emu.as_ref().and_then(|e| e.pc);
+        Rc::new(move |mx: i32, my: i32| {
+            let m = menu::MenuItem::new(&[
+                "Rename\tF2",
+                "Change type\tF3",
+                "Toggle breakpoint\tF4",
+                "Find references\tShift+F12",
+                "Copy address",
+            ]);
+            match m.popup(mx, my).and_then(|i| i.label()) {
+                Some(l) if l.starts_with("Rename") => r(),
+                Some(l) if l.starts_with("Change") => t(),
+                Some(l) if l.starts_with("Toggle") => b(),
+                Some(l) if l.starts_with("Find") => x(),
+                Some(l) if l.starts_with("Copy") => {
+                    let a = ui.borrow().sel_addr;
+                    if let Some(a) = a {
+                        app::copy(&format!("{:#x}", a));
+                    }
+                    redraw();
+                }
+                _ => {}
             }
-            redraw();
         })
     };
-    {
-        let d = do_reset.clone();
-        b_reset.set_callback(move |_| d());
-    }
 
-    let do_step: Rc<dyn Fn()> = {
+    for (view, is_asm) in [(code_view.clone(), false), (asm_view.clone(), true)] {
         let ui = ui.clone();
         let redraw = redraw.clone();
-        Rc::new(move || {
-            {
-                let mut u = ui.borrow_mut();
-                let Ui { prog: Some(p), emu: Some(e), .. } = &mut *u else { return };
-                e.exec(p);
-                let pc = e.pc;
-                u.sel_addr = pc;
+        let context = context.clone();
+        let mut view = view;
+        view.handle(move |v, ev| match ev {
+            Event::Push | Event::Released => {
+                let row = row_at(v, app::event_y());
+                {
+                    let mut u = ui.borrow_mut();
+                    if is_asm {
+                        if let Some((a, _)) = u.asm.get(row) {
+                            u.sel_addr = Some(*a);
+                        }
+                    } else if let Some((a, _)) = u.code.get(row) {
+                        u.sel_addr = *a;
+                        u.sel_var = u.var_on_line(row);
+                    }
+                }
+                if ev == Event::Push && app::event_mouse_button() == app::MouseButton::Right {
+                    let (mx, my) = app::event_coords();
+                    context(mx, my);
+                    return true;
+                }
+                redraw();
+                false
             }
-            redraw();
-        })
-    };
-    {
-        let d = do_step.clone();
-        b_step.set_callback(move |_| d());
+            _ => false,
+        });
     }
 
-    let do_run: Rc<dyn Fn()> = {
+    // ------------------------------------------------------------ wiring ----
+    {
+        let ui = ui.clone();
+        let reload = reload.clone();
+        fn_list.set_callback(move |b| {
+            let i = b.value();
+            if i > 0 {
+                let name = b.text(i).unwrap_or_default();
+                let name = name.split('\t').next().unwrap_or("").to_string();
+                let mut u = ui.borrow_mut();
+                if let Some(p) = &u.prog {
+                    if let Some(k) = p.funcs.iter().position(|f| u.fname(&f.name) == name) {
+                        u.cur = k;
+                    }
+                }
+                u.sel_addr = None;
+                u.sel_var = None;
+                u.node_pos.clear();
+                drop(u);
+                reload();
+            }
+        });
+    }
+    {
+        let reload = reload.clone();
+        filter.set_callback(move |_| reload());
+    }
+    for (b, kind) in btabs.clone() {
         let ui = ui.clone();
         let redraw = redraw.clone();
-        Rc::new(move || {
+        let mut b = b;
+        b.set_callback(move |_| {
+            ui.borrow_mut().bottom = kind;
+            redraw();
+        });
+    }
+    {
+        let ui = ui.clone();
+        detach.set_callback(move |_| detach_panel(&ui));
+    }
+    {
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        entry.set_callback(move |i| {
+            let line = i.value();
             {
                 let mut u = ui.borrow_mut();
-                let Ui { prog: Some(p), emu: Some(e), .. } = &mut *u else { return };
-                e.run(p, 5_000_000);
-                let pc = e.pc;
-                u.sel_addr = pc;
+                if u.bottom == Bottom::Output {
+                    if let Some(e) = &mut u.emu {
+                        e.stdin.push_str(&line);
+                        e.stdin.push('\n');
+                        e.out.push_str(&format!("{}\n", line));
+                    }
+                } else if u.bottom == Bottom::Strings {
+                    u.string_filter = line.to_lowercase();
+                }
             }
+            i.set_value("");
             redraw();
-        })
-    };
-    {
-        let d = do_run.clone();
-        b_run.set_callback(move |_| d());
+        });
     }
-
     {
+        let ui = ui.clone();
+        let redraw = redraw.clone();
         let mut cv = code_view.clone();
         let mut gs = graph_scroll.clone();
+        let mut gm = g_mode.clone();
         let mut a = t_code.clone();
         let mut b = t_graph.clone();
         t_code.set_callback(move |_| {
             cv.show();
             gs.hide();
+            gm.hide();
             a.set_color(HOT);
             b.set_color(PANEL2);
+            ui.borrow_mut().sel_var = None;
+            redraw();
             app::redraw();
         });
     }
     {
         let mut cv = code_view.clone();
         let mut gs = graph_scroll.clone();
+        let mut gm = g_mode.clone();
         let mut a = t_code.clone();
         let mut b = t_graph.clone();
         t_graph.set_callback(move |_| {
             cv.hide();
             gs.show();
+            gm.show();
             b.set_color(HOT);
             a.set_color(PANEL2);
             app::redraw();
         });
     }
-
     {
-        let (r, t, s, run, reset) =
-            (do_rename.clone(), do_type.clone(), do_step.clone(), do_run.clone(), do_reset.clone());
-        win.handle(move |_, ev| {
-            if ev == Event::KeyDown {
-                match app::event_key() {
-                    Key::F2 => {
-                        r();
-                        true
-                    }
-                    Key::F3 => {
-                        t();
-                        true
-                    }
-                    Key::F5 => {
-                        reset();
-                        true
-                    }
-                    Key::F7 | Key::F8 => {
-                        s();
-                        true
-                    }
-                    Key::F9 => {
-                        run();
-                        true
-                    }
-                    _ => false,
-                }
-            } else {
-                false
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        g_mode.set_callback(move |b| {
+            {
+                let mut u = ui.borrow_mut();
+                u.graph_pseudo = !u.graph_pseudo;
+                b.set_label(if u.graph_pseudo { "Graph: pseudocode" } else { "Graph: assembly" });
+                u.node_pos.clear();
             }
+            redraw();
+            app::redraw();
         });
     }
 
-    // dpp-gui <binary> [function] -- naming a function opens straight to it
+    t_code.set_color(HOT);
+
     if let Some(path) = std::env::args().nth(1) {
-        match analysis::analyze_file(&path) {
-            Ok(p) => {
-                let want = std::env::args().nth(2);
+        open_file(Some(path));
+        if let Some(name) = std::env::args().nth(2) {
+            {
                 let mut u = ui.borrow_mut();
-                if let Some(n) = want {
-                    u.cur = p.funcs.iter().position(|f| f.name == n).unwrap_or(0);
+                if let Some(p) = &u.prog {
+                    if let Some(k) = p.funcs.iter().position(|f| f.name == name) {
+                        u.cur = k;
+                    }
                 }
-                u.prog = Some(p);
-                drop(u);
-                reload();
             }
-            Err(e) => eprintln!("{}", e),
+            reload();
         }
     }
 
     app.run().unwrap();
+}
+
+fn short(p: &str) -> String {
+    p.rsplit('/').next().unwrap_or(p).to_string()
+}
+
+fn define_struct(ui: &Rc<RefCell<Ui>>) {
+    let existing: Vec<String> = ui.borrow().structs().defs.iter().map(|d| d.name.clone()).collect();
+    let prompt = format!(
+        "Existing: {}\nNew structure name:",
+        if existing.is_empty() { "none".to_string() } else { existing.join(", ") }
+    );
+    let Some(name) = dialog::input_default(&prompt, "my_struct") else { return };
+    let name = name.trim().to_string();
+    if !valid_identifier(&name) {
+        dialog::alert_default("not a valid identifier");
+        return;
+    }
+    let Some(body) = dialog::input_default(
+        "Fields, semicolon separated: offset type name",
+        "0 int x; 4 int y; 8 long tag",
+    ) else {
+        return;
+    };
+    match parse_struct(&name, &body) {
+        Some(d) => {
+            let mut u = ui.borrow_mut();
+            u.user_structs.retain(|x| x.name != d.name);
+            u.user_structs.push(d);
+        }
+        None => dialog::alert_default("could not parse the field list"),
+    }
+}
+
+/// Pop the current bottom panel into its own window, so it can be moved and
+/// resized independently.
+fn detach_panel(ui: &Rc<RefCell<Ui>>) {
+    let (title, body) = {
+        let u = ui.borrow();
+        let Some(p) = &u.prog else { return };
+        let Some(f) = u.func() else { return };
+        (format!("{:?}", u.bottom), u.bottom_text(p, f).0)
+    };
+    let mut w = window::Window::default().with_size(760, 520).with_label(&title);
+    w.set_color(PANEL);
+    let mut d = text::TextDisplay::new(0, 0, 760, 520, None);
+    let mut b = text::TextBuffer::default();
+    b.set_text(&body);
+    d.set_buffer(b);
+    style_display(&mut d);
+    w.end();
+    w.make_resizable(true);
+    w.show();
+    // FLTK keeps the window alive as long as it is shown; leaking the handle
+    // here is what lets it outlive this call.
+    std::mem::forget(w);
+}
+
+// ------------------------------------------------------------ Ui helpers ---
+impl Ui {
+    /// Text and style for whichever bottom panel is showing.
+    fn bottom_text(&self, p: &Program, f: &Analyzed) -> (String, String) {
+        let mut t = String::new();
+        let mut s = String::new();
+        let put = |line: &str, style: char, t: &mut String, s: &mut String| {
+            t.push_str(line);
+            t.push('\n');
+            s.push_str(&style.to_string().repeat(line.chars().count()));
+            s.push('\n');
+        };
+
+        match self.bottom {
+            Bottom::Registers => {
+                let Some(e) = &self.emu else { return (String::new(), String::new()) };
+                for r in SHOWN_REGS {
+                    let v = e.reg(r);
+                    let note = e.classify(v, p).describe();
+                    let line = format!("{:<4} {:016x}  {}", r, v, note);
+                    put(&line, if e.changed(r) { 'C' } else { 'A' }, &mut t, &mut s);
+                }
+                let line = format!(
+                    "rip  {}",
+                    e.pc.map(|v| format!("{:016x}", v)).unwrap_or_else(|| "--".into())
+                );
+                put(&line, 'E', &mut t, &mut s);
+            }
+
+            Bottom::Stack => {
+                let Some(e) = &self.emu else { return (String::new(), String::new()) };
+                let (sp, bp) = (e.reg("rsp"), e.reg("rbp"));
+                // frame slots are relative to the frame pointer; naming them
+                // is the whole point of having decompiled the function
+                let slots = self.slot_names(f);
+                for i in 0..20u64 {
+                    let a = sp.wrapping_add(i * 8);
+                    let v = e.read(a, 8);
+                    let mark = if a == sp {
+                        "rsp>"
+                    } else if a == bp {
+                        "rbp>"
+                    } else {
+                        "    "
+                    };
+                    let off = a as i64 - bp as i64;
+                    let named = slots
+                        .iter()
+                        .find(|(o, _)| *o == off)
+                        .map(|(_, n)| format!("{:<10}", n))
+                        .unwrap_or_else(|| " ".repeat(10));
+                    let line = format!(
+                        "{} {:012x} {} {:016x}  {}",
+                        mark,
+                        a,
+                        named,
+                        v,
+                        e.classify(v, p).describe()
+                    );
+                    put(&line, if a == sp || a == bp { 'E' } else { 'A' }, &mut t, &mut s);
+                }
+            }
+
+            Bottom::Memory => {
+                let Some(e) = &self.emu else { return (String::new(), String::new()) };
+                let base = self.sel_addr.unwrap_or_else(|| e.reg("rsp")) & !0xf;
+                for r in 0..13u64 {
+                    let a = base.wrapping_add(r * 16);
+                    let (mut h, mut c) = (String::new(), String::new());
+                    for col in 0..16u64 {
+                        let b = e.read(a + col, 1) as u8;
+                        h.push_str(&format!("{:02x} ", b));
+                        c.push(if (0x20..0x7f).contains(&b) { b as char } else { '.' });
+                    }
+                    put(&format!("{:012x}  {} {}", a, h, c), 'A', &mut t, &mut s);
+                }
+            }
+
+            Bottom::Vmmap => {
+                let Some(e) = &self.emu else { return (String::new(), String::new()) };
+                put(
+                    &format!("{:<18} {:<18} {:<5} {}", "START", "END", "PERM", "MAPPING"),
+                    'G',
+                    &mut t,
+                    &mut s,
+                );
+                for r in &e.regions {
+                    let here = e.pc.map_or(false, |pc| pc >= r.start && pc < r.end);
+                    put(
+                        &format!(
+                            "{:#018x} {:#018x} {:<5} {}",
+                            r.start, r.end, r.perm, r.name
+                        ),
+                        if here { 'E' } else { 'A' },
+                        &mut t,
+                        &mut s,
+                    );
+                }
+            }
+
+            Bottom::Strings => {
+                let q = &self.string_filter;
+                put(
+                    &format!(
+                        "{} strings{}",
+                        p.strings.len(),
+                        if q.is_empty() {
+                            "   (Ctrl+F to search, or type below)".to_string()
+                        } else {
+                            format!("   matching \"{}\"", q)
+                        }
+                    ),
+                    'G',
+                    &mut t,
+                    &mut s,
+                );
+                for (a, txt) in &p.strings {
+                    if !q.is_empty() && !txt.to_lowercase().contains(q) {
+                        continue;
+                    }
+                    put(&format!("{:#012x}  \"{}\"", a, txt), 'D', &mut t, &mut s);
+                }
+            }
+
+            Bottom::Xrefs => {
+                put(
+                    &if self.xrefs.is_empty() {
+                        "no references — put the caret on a call or a name, then Shift+F12".into()
+                    } else {
+                        format!("{} references to {}", self.xrefs.len(), self.xref_target)
+                    },
+                    'G',
+                    &mut t,
+                    &mut s,
+                );
+                for (func, addr, text) in &self.xrefs {
+                    put(&format!("{:#012x}  {:<16} {}", addr, func, text), 'A', &mut t, &mut s);
+                }
+            }
+
+            Bottom::Output => {
+                let body = match &self.emu {
+                    Some(e) if !e.out.is_empty() => e.out.clone(),
+                    _ => "(no output yet — Debug ▸ Start, then Continue)\n".to_string(),
+                };
+                for line in body.lines() {
+                    put(line, 'D', &mut t, &mut s);
+                }
+                put("", 'A', &mut t, &mut s);
+                put("type below and press Enter to send to the program's stdin", 'G', &mut t, &mut s);
+            }
+        }
+        (t, s)
+    }
+
+    /// Frame offsets of the recovered locals, relative to rbp, with the names
+    /// the pseudocode uses.
+    fn slot_names(&self, f: &Analyzed) -> Vec<(i64, String)> {
+        f.frame
+            .vars
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| !v.is_param || v.off != 0)
+            .map(|(i, v)| (v.off + 8, self.var_label(f, i)))
+            .collect()
+    }
+
+    fn graph_boxes(&self, f: &Analyzed, ox: i32, oy: i32) -> Vec<Box2> {
+        let mut boxes = graph_layout(f, ox, oy, self.graph_pseudo.then_some(&self.code));
+        for b in boxes.iter_mut() {
+            if let Some((x, y)) = self.node_pos.get(&b.addr) {
+                b.x = ox + x;
+                b.y = oy + y;
+            }
+        }
+        boxes
+    }
+}
+
+/// ASCII jump arrows down the left of the disassembly, the way objdump and
+/// Ghidra draw them: a branch and its target are joined by a rail so the loop
+/// structure is visible without reading every address.
+fn jump_arrows(asm: &[(u64, String)]) -> Vec<String> {
+    let index: HashMap<u64, usize> = asm.iter().enumerate().map(|(i, (a, _))| (*a, i)).collect();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (i, (_, text)) in asm.iter().enumerate() {
+        let t = text.to_lowercase();
+        if !(t.starts_with('j') || t.starts_with("loop")) {
+            continue;
+        }
+        let Some(tok) = t.split_whitespace().last() else { continue };
+        let hex = tok.trim_end_matches('h');
+        let Ok(target) = u64::from_str_radix(hex.trim_start_matches("0x"), 16) else { continue };
+        let Some(&j) = index.get(&target) else { continue };
+        spans.push((i.min(j), i.max(j)));
+    }
+    // give each span its own column so overlapping jumps stay readable
+    let mut lanes: Vec<Vec<(usize, usize)>> = Vec::new();
+    for sp in spans {
+        match lanes.iter_mut().find(|l| l.iter().all(|o| sp.1 < o.0 || sp.0 > o.1)) {
+            Some(l) => l.push(sp),
+            None => lanes.push(vec![sp]),
+        }
+        if lanes.len() >= 3 {
+            break;
+        }
+    }
+
+    let width = lanes.len();
+    let mut out = vec![String::new(); asm.len()];
+    for (row, cell) in out.iter_mut().enumerate() {
+        let mut line = vec![' '; width];
+        for (li, lane) in lanes.iter().enumerate() {
+            for (a, b) in lane {
+                if row == *a {
+                    line[li] = '┌';
+                } else if row == *b {
+                    line[li] = '└';
+                } else if row > *a && row < *b {
+                    line[li] = '│';
+                }
+            }
+        }
+        let tail = if line.iter().any(|c| *c == '┌' || *c == '└') { "─▶ " } else { "   " };
+        *cell = format!("{}{}", line.into_iter().collect::<String>(), tail);
+    }
+    out
+}
+
+const ASM_KEYWORDS: [&str; 24] = [
+    "mov", "lea", "push", "pop", "call", "ret", "jmp", "je", "jne", "jl", "jle", "jg", "jge", "jb",
+    "jbe", "ja", "jae", "js", "jns", "test", "cmp", "add", "sub", "leave",
+];
+
+/// Colour one disassembly line: mnemonic, registers, immediates.
+fn style_asm(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = vec![b'A'; b.len()];
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut first = true;
+    let mut i = 0;
+    while i < b.len() {
+        if ident(b[i]) && (i == 0 || !ident(b[i - 1])) {
+            let start = i;
+            while i < b.len() && ident(b[i]) {
+                i += 1;
+            }
+            let w = &text[start..i];
+            let style = if first {
+                first = false;
+                if ASM_KEYWORDS.contains(&w) || w.starts_with('j') {
+                    b'B'
+                } else {
+                    b'E'
+                }
+            } else if w.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                b'C'
+            } else if is_register(w) {
+                b'F'
+            } else {
+                b'A'
+            };
+            out[start..i].fill(style);
+            continue;
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn is_register(w: &str) -> bool {
+    const R: [&str; 20] = [
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "eax", "ebx", "ecx", "edx", "esi",
+        "edi", "ebp", "esp", "al", "bl", "cl", "dl",
+    ];
+    R.contains(&w) || (w.starts_with('r') && w[1..].chars().all(|c| c.is_ascii_digit()))
+        || (w.starts_with("xmm") && w[3..].chars().all(|c| c.is_ascii_digit()))
 }
 
 // ------------------------------------------------------------------ helpers --
@@ -999,12 +1547,12 @@ fn parse_struct(name: &str, body: &str) -> Option<StructDef> {
     Some(StructDef { name: name.to_string(), fields, size: end.max(0) as usize })
 }
 
-fn tool_button(x: i32, y: i32, w: i32, label: &str) -> button::Button {
-    let mut b = button::Button::new(x, y, w, 26, None).with_label(label);
+fn tab_button(x: i32, y: i32, w: i32, label: &str) -> button::Button {
+    let mut b = button::Button::new(x, y, w, 24, None).with_label(label);
     b.set_color(PANEL2);
     b.set_label_color(FG);
     b.set_frame(FrameType::FlatBox);
-    b.set_label_size(12);
+    b.set_label_size(11);
     b.clear_visible_focus();
     b
 }
@@ -1023,6 +1571,12 @@ fn pane(x: i32, y: i32, w: i32, h: i32, title: &str) -> group::Group {
 }
 
 fn style_display(d: &mut text::TextDisplay) {
+    // a visible caret: without it there is no way to tell where the keyboard
+    // is pointing, and every action that acts on "the current line" looks
+    // like it does nothing
+    d.set_cursor_style(text::Cursor::Block);
+    d.show_cursor(true);
+    d.set_cursor_color(ACCENT);
     d.set_color(PANEL);
     d.set_text_color(FG);
     d.set_text_font(Font::Courier);
@@ -1063,7 +1617,12 @@ struct Box2 {
 
 /// Layered layout: rank each block by its distance from the entry, then pack
 /// each rank left to right.
-fn graph_layout(f: &Analyzed, ox: i32, oy: i32) -> Vec<Box2> {
+fn graph_layout(
+    f: &Analyzed,
+    ox: i32,
+    oy: i32,
+    pseudo: Option<&Vec<(Option<u64>, String)>>,
+) -> Vec<Box2> {
     let cfg = Cfg::build(&f.insns);
     let mut rank: HashMap<u64, usize> = HashMap::new();
     if let Some(b0) = cfg.blocks.first() {
@@ -1098,11 +1657,27 @@ fn graph_layout(f: &Analyzed, ox: i32, oy: i32) -> Vec<Box2> {
         let mut tallest = 0;
         for &bi in row {
             let b = &cfg.blocks[bi];
-            let text: Vec<String> =
-                b.instrs.iter().map(|&i| f.insns[i].asm_text.clone()).collect();
+            // a block shows either its instructions or the pseudocode lines
+            // that came from them
+            let text: Vec<String> = match pseudo {
+                Some(lines) => {
+                    let addrs: Vec<u64> = b.instrs.iter().map(|&i| f.insns[i].addr).collect();
+                    let picked: Vec<String> = lines
+                        .iter()
+                        .filter(|(a, _)| a.map_or(false, |a| addrs.contains(&a)))
+                        .map(|(_, t)| t.trim().to_string())
+                        .collect();
+                    if picked.is_empty() {
+                        vec!["(no statements)".to_string()]
+                    } else {
+                        picked
+                    }
+                }
+                None => b.instrs.iter().map(|&i| f.insns[i].asm_text.clone()).collect(),
+            };
             let widest = text.iter().map(|t| t.len()).max().unwrap_or(10).max(12);
             let w = (widest as i32 * 7 + 24).min(500);
-            let h = 20 + 13 * (text.len() as i32 + 1);
+            let h = 26 + 13 * text.len() as i32;
             tallest = tallest.max(h);
             out.push(Box2 {
                 addr: b.addr,

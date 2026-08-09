@@ -772,6 +772,8 @@ pub struct Program {
     pub symbols: HashMap<u64, String>,
     pub text_range: (u64, u64),
     pub plt_count: usize,
+    /// printable strings found in the image, for the strings view
+    pub strings: Vec<(u64, String)>,
 }
 
 pub fn analyze_bytes(path: &str, bytes: &[u8]) -> Result<Program, String> {
@@ -881,7 +883,16 @@ pub fn analyze_bytes(path: &str, bytes: &[u8]) -> Result<Program, String> {
         }
     }
 
+    let mut strings: Vec<(u64, String)> = globals
+        .strings
+        .iter()
+        .map(|(a, s)| (*a, s.clone()))
+        .collect();
+    strings.sort_by_key(|(a, _)| *a);
+    strings.dedup_by_key(|(a, _)| *a);
+
     Ok(Program {
+        strings,
         path: path.to_string(),
         funcs: results,
         structs,
@@ -890,6 +901,47 @@ pub fn analyze_bytes(path: &str, bytes: &[u8]) -> Result<Program, String> {
         text_range: (text_addr, text_end),
         plt_count: plt_symbols.len(),
     })
+}
+
+/// Every place in the binary that refers to `target` -- as a call, as a
+/// branch, or as a constant handed around as a value.
+pub fn references_to(prog: &Program, target: u64, name: &str) -> Vec<(String, u64, String)> {
+    let mut out = Vec::new();
+    for f in &prog.funcs {
+        for ins in &f.raw {
+            let mut hit = ins.targets.contains(&target);
+            if !hit {
+                for st in &ins.stmts {
+                    let mut found = false;
+                    let mut probe = |e: &Expr| {
+                        e.walk(&mut |x| match x {
+                            Expr::Const(v) if *v as u64 == target => found = true,
+                            Expr::Lit(s) if s == name => found = true,
+                            Expr::Call { name: n, .. } if n == name => found = true,
+                            Expr::Mem(m) if m.rip_abs == Some(target) => found = true,
+                            _ => {}
+                        });
+                    };
+                    match st {
+                        Stmt::Assign { dst, src } => {
+                            probe(dst);
+                            probe(src);
+                        }
+                        Stmt::Do(e) | Stmt::Return(Some(e)) | Stmt::If { cond: e, .. } => probe(e),
+                        _ => {}
+                    }
+                    if found {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            if hit {
+                out.push((f.name.clone(), ins.addr, ins.asm_text.clone()));
+            }
+        }
+    }
+    out
 }
 
 pub fn analyze_file(path: &str) -> Result<Program, String> {
