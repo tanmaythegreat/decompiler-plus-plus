@@ -9,7 +9,21 @@
 #   make show-O2     # build+decompile+print just the -O2 variant
 #   make clean
 
-CC          := gcc
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+CC           := clang
+ARCH_FLAGS   := -arch x86_64
+COMMON_FLAGS := -fno-stack-protector $(ARCH_FLAGS)
+STRIP        := strip -x
+ALL_VARIANTS := O0 O1 O2 O3 stripped pie obj
+else
+CC           := gcc
+ARCH_FLAGS   :=
+COMMON_FLAGS := -fno-stack-protector -no-pie
+STRIP        := strip --strip-all
+ALL_VARIANTS := O0 O1 O2 O3 static stripped pie obj
+endif
 SRC         := testing.c
 BUILD_DIR   := bin
 DECOMP_DIR  := decompiled
@@ -37,10 +51,8 @@ MAX_FUNCS      := 30
 
 # Common flags: no stack protector / no PIE so addresses+disasm stay simple
 # and easy to read; each variant then adds/overrides on top of this.
-COMMON_FLAGS := -fno-stack-protector -no-pie
 
 # variant-name -> extra gcc flags
-ALL_VARIANTS  := O0 O1 O2 O3 static stripped pie obj
 ifeq ($(HAS_MAIN),1)
 VARIANTS      := $(ALL_VARIANTS)
 else
@@ -61,15 +73,16 @@ REPORTS  := $(addprefix $(DECOMP_DIR)/testing_,$(addsuffix .txt,$(VARIANTS)))
 .PHONY: all build decompile clean $(addprefix show-,$(VARIANTS)) decompiler
 
 all: decompile
+$(info building for x86-64 with $(CC)$(if $(ARCH_FLAGS), $(ARCH_FLAGS),) on $(UNAME_S))
 
-# --- build the decompiler itself ---------------------------------------
+#build the decompiler itself
 decompiler: $(DECOMPILER_BIN)
 
 $(DECOMPILER_BIN):
 	@echo "==> building mini_decompiler (release)"
 	cargo build --release --manifest-path $(DECOMPILER_DIR)/Cargo.toml
 
-# --- build all binary variants ------------------------------------------
+#build all binary variants
 build: $(BINARIES)
 
 $(BUILD_DIR):
@@ -78,13 +91,13 @@ $(BUILD_DIR):
 # pie variant conflicts with -no-pie in COMMON_FLAGS, so it overrides fully
 $(BUILD_DIR)/testing_pie: $(SRC) | $(BUILD_DIR)
 	@echo "==> [pie] $(CC) $(FLAGS.pie) -o $@ $(SRC)"
-	$(CC) -fno-stack-protector $(FLAGS.pie) -o $@ $(SRC)
+	$(CC) -fno-stack-protector $(ARCH_FLAGS) $(FLAGS.pie) -o $@ $(SRC)
 
 # object file — compile only, never linked, so no `main` is required.
 # Useful for library-style testing.c files that are just free functions.
 $(BUILD_DIR)/testing_obj: $(SRC) | $(BUILD_DIR)
 	@echo "==> [obj] $(CC) -Wall -fno-stack-protector -c -o $@ $(SRC)  (no main required)"
-	$(CC) -Wall -fno-stack-protector -c -o $@ $(SRC)
+	$(CC) -Wall -fno-stack-protector $(ARCH_FLAGS) -c -o $@ $(SRC)
 
 # static variant also can't take -no-pie the same way on some toolchains,
 # gcc handles -static -no-pie together fine though, so keep it simple.
@@ -95,7 +108,7 @@ $(BUILD_DIR)/testing_static: $(SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/testing_stripped: $(SRC) | $(BUILD_DIR)
 	@echo "==> [stripped] $(CC) $(COMMON_FLAGS) $(FLAGS.stripped) -o $@ $(SRC), then strip"
 	$(CC) $(COMMON_FLAGS) $(FLAGS.stripped) -o $@ $(SRC)
-	strip --strip-all $@
+	$(STRIP) $@
 
 $(BUILD_DIR)/testing_O0: $(SRC) | $(BUILD_DIR)
 	@echo "==> [O0] $(CC) $(COMMON_FLAGS) $(FLAGS.O0) -o $@ $(SRC)"
@@ -113,7 +126,7 @@ $(BUILD_DIR)/testing_O3: $(SRC) | $(BUILD_DIR)
 	@echo "==> [O3] $(CC) $(COMMON_FLAGS) $(FLAGS.O3) -o $@ $(SRC)"
 	$(CC) $(COMMON_FLAGS) $(FLAGS.O3) -o $@ $(SRC)
 
-# --- run the decompiler against every variant ---------------------------
+#run the decompiler against every variant
 decompile: $(REPORTS)
 
 $(DECOMP_DIR):
@@ -129,7 +142,7 @@ $(DECOMP_DIR)/testing_%.txt: $(BUILD_DIR)/testing_% $(DECOMPILER_BIN) | $(DECOMP
 	$(DECOMPILER_BIN) $< $(MAX_FUNCS)                       >> $@
 	@echo "    -> $@"
 
-# --- convenience: build+decompile+print one variant on demand -----------
+#build+decompile+print one variant on demand
 show-%: $(DECOMP_DIR)/testing_%.txt
 	@cat $<
 

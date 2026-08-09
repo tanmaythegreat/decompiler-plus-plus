@@ -89,13 +89,13 @@ fn main() {
         eprintln!("failed to read {}: {}", opts.path, e);
         std::process::exit(1);
     });
-    let obj = object::File::parse(&*bytes).unwrap_or_else(|e| {
-        eprintln!("failed to parse object file: {}", e);
+    let obj = mini_decompiler::analysis::open_object(&opts.path, &bytes).unwrap_or_else(|e| {
+        eprintln!("{}", e);
         std::process::exit(1);
     });
 
-    let text = obj.sections().find(|s| s.name() == Ok(".text")).unwrap_or_else(|| {
-        eprintln!("no .text section found");
+    let text = mini_decompiler::analysis::code_section(&obj).unwrap_or_else(|| {
+        eprintln!("the file has no executable section, so there is no code to decompile");
         std::process::exit(1);
     });
     let text_addr = text.address();

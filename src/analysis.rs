@@ -153,7 +153,8 @@ pub fn build_globals(obj: &object::File) -> GlobalMap {
         let name = sec.name().unwrap_or("");
         if !matches!(
             name,
-            ".rodata" | ".rodata.str1.1" | ".rodata.str1.8" | ".data" | ".data.rel.ro" | ".text"
+            ".rodata" | ".rodata.str1.1" | ".rodata.str1.8" | ".data" | ".data.rel.ro"
+            | ".text" | "__cstring" | "__const" | "__text" | ".rdata"
         ) {
             continue;
         }
@@ -627,7 +628,11 @@ pub fn emit_json(
     let mut mem = Vec::new();
     for sec in obj.sections() {
         let name = sec.name().unwrap_or("");
-        if !matches!(name, ".text" | ".rodata" | ".data" | ".data.rel.ro" | ".got" | ".got.plt") {
+        if !matches!(
+            name,
+            ".text" | ".rodata" | ".data" | ".data.rel.ro" | ".got" | ".got.plt" | ".rdata"
+                | "__text" | "__cstring" | "__const" | "__data"
+        ) {
             continue;
         }
         let Ok(data) = sec.data() else { continue };
@@ -776,9 +781,61 @@ pub struct Program {
     pub strings: Vec<(u64, String)>,
 }
 
+/// The section holding the code. ELF and PE call it `.text`; Mach-O calls it
+/// `__text`; a linker script can call it anything. Falling back to "the
+/// executable section with the most bytes in it" means a file with an unusual
+/// layout still opens instead of being rejected outright.
+pub fn code_section<'a>(obj: &'a object::File) -> Option<object::Section<'a, 'a>> {
+    if let Some(s) = obj
+        .sections()
+        .find(|s| matches!(s.name(), Ok(".text") | Ok("__text") | Ok("CODE")))
+    {
+        return Some(s);
+    }
+    obj.sections()
+        .filter(|s| {
+            matches!(s.kind(), object::SectionKind::Text) && s.size() > 0
+        })
+        .max_by_key(|s| s.size())
+}
+
+/// Sections worth handing to the stepper: anything with real bytes that the
+/// program could read. Listing them by name misses every format but ELF.
+fn is_loadable(s: &object::Section) -> bool {
+    use object::SectionKind::*;
+    matches!(
+        s.kind(),
+        Text | Data | ReadOnlyData | ReadOnlyString | ReadOnlyDataWithRel | UninitializedData
+    ) && s.size() > 0
+        && s.address() != 0
+}
+
+/// Parse an object file, with an error a person can act on.
+pub fn open_object<'a>(path: &str, bytes: &'a [u8]) -> Result<object::File<'a>, String> {
+    let obj = object::File::parse(bytes).map_err(|e| {
+        format!(
+            "could not parse {} as an object file: {}\n\n\
+             Supported: ELF, PE/COFF and Mach-O executables, shared libraries \
+             and .o files. A script, an archive, a core dump or a packed \
+             binary will not open.",
+            path.rsplit('/').next().unwrap_or(path),
+            e
+        )
+    })?;
+    if obj.architecture() != object::Architecture::X86_64 {
+        return Err(format!(
+            "{:?} binaries are not supported — this decompiler lifts x86-64 only.",
+            obj.architecture()
+        ));
+    }
+    Ok(obj)
+}
+
 pub fn analyze_bytes(path: &str, bytes: &[u8]) -> Result<Program, String> {
-    let obj = object::File::parse(bytes).map_err(|e| format!("parse failed: {}", e))?;
-    let text = obj.sections().find(|s| s.name() == Ok(".text")).ok_or("no .text section")?;
+    let obj = open_object(path, bytes)?;
+    let text = code_section(&obj).ok_or(
+        "the file has no executable section, so there is no code to decompile",
+    )?;
     let text_addr = text.address();
     let text_data = text.data().unwrap_or(&[]);
     let text_end = text_addr + text_data.len() as u64;
@@ -870,13 +927,10 @@ pub fn analyze_bytes(path: &str, bytes: &[u8]) -> Result<Program, String> {
 
     let mut memory = Vec::new();
     for sec in obj.sections() {
-        let name = sec.name().unwrap_or("").to_string();
-        if !matches!(
-            name.as_str(),
-            ".text" | ".rodata" | ".data" | ".data.rel.ro" | ".got" | ".got.plt" | ".bss"
-        ) {
+        if !is_loadable(&sec) {
             continue;
         }
+        let name = sec.name().unwrap_or("<unnamed>").to_string();
         let data = sec.data().unwrap_or(&[]).to_vec();
         if !data.is_empty() {
             memory.push((name, sec.address(), data));

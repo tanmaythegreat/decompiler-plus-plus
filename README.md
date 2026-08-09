@@ -49,6 +49,7 @@ same in both.
 | F4 | toggle a breakpoint on the selected line |
 | F5 | start, or restart, the program |
 | F7 | execute one instruction |
+| F8 | step over a call |
 | F9 | continue to the next breakpoint |
 | Ctrl+F | search the strings |
 | Shift+F12 | find references to what the caret is on |
@@ -234,3 +235,13 @@ and `getchar` read.
 
 Any bottom panel can be `Detach`ed into its own window, which can then be moved
 and resized independently.
+
+## File formats
+
+ELF, PE/COFF and Mach-O are all read through the same loader — executables,
+shared libraries and `.o` files. The code section is found by kind rather than
+by name, so `.text`, `__text` and anything a linker script invented all work,
+and every loadable section is handed to the stepper rather than a hardcoded
+list. Only x86-64 is lifted; anything else is refused by name rather than
+misdecompiled. A file that is not an object file at all gets an error saying
+so instead of a parser message.

@@ -60,6 +60,8 @@ struct Ui {
     xrefs: Vec<(String, u64, String)>,
     xref_target: String,
     string_filter: String,
+    /// address the Memory pane is showing, independent of the code selection
+    mem_focus: Option<u64>,
 }
 
 impl Ui {
@@ -85,6 +87,7 @@ impl Ui {
             xrefs: Vec::new(),
             xref_target: String::new(),
             string_filter: String::new(),
+            mem_focus: None,
         }
     }
 
@@ -948,6 +951,25 @@ fn main() {
         menubar.add("&Debug/Ste&p\t", Shortcut::from_key(Key::F7), menu::MenuFlag::Normal, move |_| s());
     }
     {
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        menubar.add(
+            "&Debug/Step &over\t",
+            Shortcut::from_key(Key::F8),
+            menu::MenuFlag::Normal,
+            move |_| {
+                {
+                    let mut u = ui.borrow_mut();
+                    let Ui { prog: Some(p), emu: Some(e), .. } = &mut *u else { return };
+                    e.step_over(p);
+                    let pc = e.pc;
+                    u.sel_addr = pc;
+                }
+                redraw();
+            },
+        );
+    }
+    {
         let c = cont.clone();
         menubar.add("&Debug/&Continue\t", Shortcut::from_key(Key::F9), menu::MenuFlag::Normal, move |_| c());
     }
@@ -1070,6 +1092,31 @@ fn main() {
     {
         let ui = ui.clone();
         detach.set_callback(move |_| detach_panel(&ui));
+    }
+    {
+        // clicking a row that shows an address follows it in the Memory pane
+        let ui = ui.clone();
+        let redraw = redraw.clone();
+        let mut lv = lower_view.clone();
+        lv.handle(move |v, ev| {
+            if ev == Event::Released {
+                let row = row_at(v, app::event_y());
+                let pos = v.skip_lines(0, row as i32, true);
+                let line = v.buffer().map(|b| b.line_text(pos));
+                if let Some(line) = line {
+                    if let Some(a) = first_address(&line) {
+                        let mut u = ui.borrow_mut();
+                        u.mem_focus = Some(a);
+                        if u.bottom != Bottom::Memory {
+                            u.bottom = Bottom::Memory;
+                        }
+                        drop(u);
+                        redraw();
+                    }
+                }
+            }
+            false
+        });
     }
     {
         let ui = ui.clone();
@@ -1282,7 +1329,13 @@ impl Ui {
 
             Bottom::Memory => {
                 let Some(e) = &self.emu else { return (String::new(), String::new()) };
-                let base = self.sel_addr.unwrap_or_else(|| e.reg("rsp")) & !0xf;
+                let base = self.mem_focus.unwrap_or_else(|| e.reg("rsp")) & !0xf;
+                put(
+                    &format!("{:#x}   {}", base, e.classify(base, p).describe()),
+                    'G',
+                    &mut t,
+                    &mut s,
+                );
                 for r in 0..13u64 {
                     let a = base.wrapping_add(r * 16);
                     let (mut h, mut c) = (String::new(), String::new());
@@ -1668,7 +1721,21 @@ fn graph_layout(
                         .map(|(_, t)| t.trim().to_string())
                         .collect();
                     if picked.is_empty() {
-                        vec!["(no statements)".to_string()]
+                        // a block whose only job is the loop or branch test
+                        // produced a structural line with no address; show
+                        // the test itself rather than nothing
+                        b.instrs
+                            .iter()
+                            .map(|&i| f.insns[i].asm_text.clone())
+                            .filter(|t| {
+                                let t = t.to_lowercase();
+                                t.starts_with("cmp") || t.starts_with("test") || t.starts_with('j')
+                            })
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .chain(std::iter::once("(condition)".to_string()))
+                            .take(4)
+                            .collect()
                     } else {
                         picked
                     }
@@ -1694,4 +1761,21 @@ fn graph_layout(
         y += tallest + 50;
     }
     out
+}
+
+/// The first hex address on a line of a panel, so clicking a row can follow it.
+fn first_address(line: &str) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for tok in line.split(|c: char| !(c.is_ascii_hexdigit() || c == 'x')) {
+        let t = tok.trim_start_matches("0x");
+        if t.len() >= 6 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            if let Ok(v) = u64::from_str_radix(t, 16) {
+                if v > 0x1000 {
+                    best = Some(v);
+                    break;
+                }
+            }
+        }
+    }
+    best
 }

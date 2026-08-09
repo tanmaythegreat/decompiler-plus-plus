@@ -122,13 +122,7 @@ impl Emu {
                 start: *base,
                 end: base + data.len() as u64,
                 name: format!("{} [{}]", name, short_name(&prog.path)),
-                perm: if name == ".text" {
-                    "r-x"
-                } else if name.starts_with(".ro") {
-                    "r--"
-                } else {
-                    "rw-"
-                },
+                perm: perm_of(name),
             });
         }
         e.regions.push(Region {
@@ -740,6 +734,23 @@ impl Emu {
         }
     }
 
+    /// Execute one instruction, but if it is a call, run the callee to
+    /// completion instead of stopping inside it.
+    pub fn step_over(&mut self, prog: &Program) {
+        let Some(pc) = self.pc else { return };
+        let is_call = self.current(prog).map_or(false, |i| i.is_call);
+        self.exec(prog);
+        if !is_call {
+            return;
+        }
+        // a lifted call is executed as an expression, so control has already
+        // come back; nothing further to do unless it transferred
+        let Some(after) = self.pc else { return };
+        if after == pc {
+            return;
+        }
+    }
+
     pub fn toggle_breakpoint(&mut self, a: u64) {
         if !self.breakpoints.remove(&a) {
             self.breakpoints.insert(a);
@@ -748,6 +759,21 @@ impl Emu {
 
     pub fn started(&self) -> bool {
         self.steps > 0 || self.halted
+    }
+}
+
+/// Permissions the loader would give a section, by name. Close enough to be
+/// useful when reading a memory map, which is what it is for.
+fn perm_of(name: &str) -> &'static str {
+    const EXEC: [&str; 6] = [".text", ".init", ".fini", ".plt", ".plt.sec", "__text"];
+    const RO: [&str; 7] =
+        [".rodata", ".rdata", ".eh_frame", ".eh_frame_hdr", ".interp", "__cstring", "__const"];
+    if EXEC.iter().any(|p| name.starts_with(p)) {
+        "r-x"
+    } else if RO.iter().any(|p| name.starts_with(p)) {
+        "r--"
+    } else {
+        "rw-"
     }
 }
 
