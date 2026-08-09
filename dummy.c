@@ -1,2 +1,1 @@
-#include <stdio.h>
-int main() { return (long)printf; }
+int main() { return 0; }

@@ -117,6 +117,7 @@ fn main() {
             name: lifter::sanitize_name(s.name().unwrap_or("?")),
             start: s.address(),
             end: (s.address() + s.size()).min(text_end),
+            is_lib: false,
         })
         .collect();
     funcs.sort_by_key(|f| f.start);

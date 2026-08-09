@@ -64,6 +64,8 @@ struct Ui {
     mem_focus: Option<u64>,
     history: Vec<usize>,
     history_idx: usize,
+    /// when true, library/FLIRT-matched functions are hidden from the function list
+    hide_lib_fns: bool,
 }
 
 impl Ui {
@@ -92,6 +94,7 @@ impl Ui {
             mem_focus: None,
             history: Vec::new(),
             history_idx: 0,
+            hide_lib_fns: false,
         }
     }
 
@@ -352,7 +355,14 @@ fn main() {
     filter.set_text_color(FG);
     filter.set_text_size(12);
     filter.set_frame(FrameType::FlatBox);
-    let mut fn_list = browser::HoldBrowser::new(2, 74, 236, 612, None);
+    let mut hide_lib_cb = button::CheckButton::new(4, 70, 232, 20, "Hide library functions");
+    hide_lib_cb.set_value(false);
+    hide_lib_cb.set_label_color(FG);
+    hide_lib_cb.set_label_size(11);
+    hide_lib_cb.set_color(PANEL);
+    hide_lib_cb.set_selection_color(ACCENT);
+    hide_lib_cb.set_frame(FrameType::FlatBox);
+    let mut fn_list = browser::HoldBrowser::new(2, 96, 236, 590, None);
     fn_list.set_color(PANEL);
     fn_list.set_selection_color(HOT);
     fn_list.set_text_size(12);
@@ -656,6 +666,7 @@ fn main() {
         let ui = ui.clone();
         let fn_list = fn_list.clone();
         let filter = filter.clone();
+        let hide_lib_cb = hide_lib_cb.clone();
         let redraw = redraw.clone();
         Rc::new(move || {
             let mut fn_list = fn_list.clone();
@@ -668,9 +679,15 @@ fn main() {
             {
                 let u = ui.borrow();
                 let pat = filter.value().to_lowercase();
+                let hide_lib = hide_lib_cb.value();
                 if let Some(p) = &u.prog {
                     for (i, f) in p.funcs.iter().enumerate() {
                         let name = u.fname(&f.name);
+                        // Use the authoritative is_lib flag set by FLIRT at analysis time.
+                        // This is correct even after the user renames the function.
+                        if hide_lib && f.is_lib && i != u.cur {
+                            continue;
+                        }
                         if !pat.is_empty() && !name.to_lowercase().contains(&pat) {
                             continue;
                         }

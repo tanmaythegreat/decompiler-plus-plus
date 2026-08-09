@@ -16,6 +16,8 @@ pub struct FuncRegion {
     pub name: String,
     pub start: u64,
     pub end: u64,
+    /// true when this function was renamed by FLIRT signature matching
+    pub is_lib: bool,
 }
 
 pub fn resolve_plt_targets(obj: &object::File) -> HashMap<u64, String> {
@@ -350,6 +352,9 @@ pub struct Analyzed {
     /// viewer's stepper executes -- the analysed form has had its frame
     /// folded away and is no longer a faithful model of the machine
     pub raw: Vec<LiftedInsn>,
+    /// true when this function was renamed by FLIRT — stays true even
+    /// after the user gives it a custom name in the GUI
+    pub is_lib: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,7 +435,7 @@ pub fn analyze(
         simplify::dce_block(&mut insns[first..=last], &live_out[b]);
     }
 
-    Analyzed { name: name.to_string(), addr: start, size: slice.len(), insns, frame, ret_width, raw }
+    Analyzed { name: name.to_string(), addr: start, size: slice.len(), insns, frame, ret_width, raw, is_lib: false }
 }
 
 /// If the function returns a variable we typed as a pointer, the signature
@@ -848,6 +853,7 @@ pub fn analyze_bytes(path: &str, bytes: &[u8], sig_path: Option<&str>, custom_si
             name: lifter::sanitize_name(s.name().unwrap_or("?")),
             start: s.address(),
             end: (s.address() + s.size()).min(text_end),
+            is_lib: false,
         })
         .collect();
     funcs.sort_by_key(|f| f.start);
@@ -913,6 +919,21 @@ pub fn analyze_bytes(path: &str, bytes: &[u8], sig_path: Option<&str>, custom_si
             false, 
             "default_libvcruntime_msvc_x64"
         );
+    } else if obj.format() == object::BinaryFormat::Elf {
+        // For ELF static binaries: generate signatures directly from the system's libc.a.
+        // This parses every .o file in the archive and wildcards relocation bytes so the
+        // pattern matches regardless of link-time address layout.
+        match crate::flirt::auto_generate_libc_signatures() {
+            Ok(libc_sigs) => {
+                let matched = crate::flirt::apply_custom_sigs(
+                    &mut funcs, text_data, text_addr, &libc_sigs
+                );
+                if matched > 0 {
+                    println!("Auto-libc: matched {} functions", matched);
+                }
+            }
+            Err(e) => eprintln!("Auto-libc: failed to generate signatures: {}", e),
+        }
     }
     
     if let Some(sigs) = custom_sigs {
@@ -947,7 +968,7 @@ pub fn analyze_bytes(path: &str, bytes: &[u8], sig_path: Option<&str>, custom_si
     let mut results = Vec::new();
     for f in &selected {
         let Some(slice) = slice_of(text_data, text_addr, f) else { continue };
-        results.push(analyze(
+        let mut a = analyze(
             &f.name,
             f.start,
             slice,
@@ -956,7 +977,9 @@ pub fn analyze_bytes(path: &str, bytes: &[u8], sig_path: Option<&str>, custom_si
             &globals,
             &mut structs,
             &known,
-        ));
+        );
+        a.is_lib = f.is_lib;  // propagate FLIRT tag from FuncRegion
+        results.push(a);
     }
 
 
@@ -1090,6 +1113,7 @@ pub fn scan_function_starts(obj: &object::File, text_addr: u64, data: &[u8]) -> 
             name: format!("sub_{:x}", s),
             start: s,
             end: v.get(i + 1).copied().unwrap_or(text_end),
+            is_lib: false,
         })
         .collect()
 }
