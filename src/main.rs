@@ -27,12 +27,14 @@ struct Options {
     show_asm: bool,
     json_out: Option<String>,
     only: Option<String>,
+    flirt: Option<String>,
+    auto_libc: bool,
 }
 
 fn parse_args() -> Options {
     let args: Vec<String> = env::args().collect();
     let mut o =
-        Options { path: String::new(), max_funcs: 16, show_asm: false, only: None, json_out: None };
+        Options { path: String::new(), max_funcs: 16, show_asm: false, only: None, json_out: None, flirt: None, auto_libc: false };
     let mut positional = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -48,6 +50,11 @@ fn parse_args() -> Options {
                 i += 1;
                 o.only = args.get(i).cloned();
             }
+            "--flirt" => {
+                i += 1;
+                o.flirt = args.get(i).cloned();
+            }
+            "--auto-libc" => o.auto_libc = true,
             "-n" => {
                 i += 1;
                 o.max_funcs = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(16);
@@ -151,6 +158,20 @@ fn main() {
             if let Some(name) = call_symbols.get(&f.start) {
                 f.name = lifter::sanitize_name(name);
             }
+        }
+    }
+
+    if let Some(sig_path) = &opts.flirt {
+        mini_decompiler::flirt::match_signatures(&mut funcs, text_data, text_addr, sig_path);
+    }
+    
+    if opts.auto_libc {
+        match mini_decompiler::flirt::auto_generate_libc_signatures() {
+            Ok(sigs) => {
+                let count = mini_decompiler::flirt::apply_custom_sigs(&mut funcs, text_data, text_addr, &sigs);
+                println!("Auto-libc: matched {} functions", count);
+            },
+            Err(e) => eprintln!("Auto-libc failed: {}", e),
         }
     }
 

@@ -706,7 +706,7 @@ fn main() {
                     f.to_string_lossy().to_string()
                 }
             };
-            match analysis::analyze_file(&path) {
+            match analysis::analyze_file(&path, None, None) {
                 Ok(p) => {
                     let mut u = ui.borrow_mut();
                     u.cur = p.funcs.iter().position(|f| f.name == "main").unwrap_or(0);
@@ -912,6 +912,73 @@ fn main() {
     {
         let o = open_file.clone();
         menubar.add("&File/&Open binary…\t", Shortcut::Ctrl | 'o', menu::MenuFlag::Normal, move |_| o(None));
+    }
+    {
+        let ui = ui.clone();
+        let reload = reload.clone();
+        menubar.add(
+            "&File/Load &FLIRT Signature…\t",
+            Shortcut::None,
+            menu::MenuFlag::Normal,
+            move |_| {
+                let mut c = dialog::NativeFileChooser::new(dialog::NativeFileChooserType::BrowseFile);
+                c.set_filter("FLIRT Signatures\t*.{sig,pat}");
+                c.show();
+                let f = c.filename();
+                if f.as_os_str().is_empty() {
+                    return;
+                }
+                let sig_path = f.to_string_lossy().to_string();
+                let u = ui.borrow_mut();
+                if let Some(path) = u.prog.as_ref().map(|p| p.path.clone()) {
+                    drop(u);
+                    match analysis::analyze_file(&path, Some(&sig_path), None) {
+                        Ok(p) => {
+                            let mut u = ui.borrow_mut();
+                            u.prog = Some(p);
+                            u.emu = None;
+                            drop(u);
+                            reload();
+                        }
+                        Err(e) => dialog::alert_default(&format!("Failed: {}", e)),
+                    }
+                } else {
+                    dialog::alert_default("Please open a binary first.");
+                }
+            },
+        );
+    }
+    {
+        let ui = ui.clone();
+        let reload = reload.clone();
+        menubar.add(
+            "&File/Auto-Generate &libc Signatures\t",
+            Shortcut::None,
+            menu::MenuFlag::Normal,
+            move |_| {
+                let u = ui.borrow_mut();
+                if let Some(path) = u.prog.as_ref().map(|p| p.path.clone()) {
+                    drop(u);
+                    match mini_decompiler::flirt::auto_generate_libc_signatures() {
+                        Ok(sigs) => {
+                            match analysis::analyze_file(&path, None, Some(&sigs)) {
+                                Ok(p) => {
+                                    let mut u = ui.borrow_mut();
+                                    u.prog = Some(p);
+                                    u.emu = None;
+                                    drop(u);
+                                    reload();
+                                }
+                                Err(e) => dialog::alert_default(&format!("Failed to analyze: {}", e)),
+                            }
+                        }
+                        Err(e) => dialog::alert_default(&format!("Auto-generate failed: {}", e)),
+                    }
+                } else {
+                    dialog::alert_default("Please open a binary first.");
+                }
+            },
+        );
     }
     menubar.add("&File/&Quit\t", Shortcut::Ctrl | 'q', menu::MenuFlag::Normal, |_| app::quit());
     {

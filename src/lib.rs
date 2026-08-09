@@ -12,3 +12,5 @@ pub mod json;
 pub mod lifter;
 pub mod ptr;
 pub mod simplify;
+pub mod flirt;
+pub mod default_sigs;

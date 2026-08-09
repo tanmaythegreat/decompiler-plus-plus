@@ -831,7 +831,7 @@ pub fn open_object<'a>(path: &str, bytes: &'a [u8]) -> Result<object::File<'a>, 
     Ok(obj)
 }
 
-pub fn analyze_bytes(path: &str, bytes: &[u8]) -> Result<Program, String> {
+pub fn analyze_bytes(path: &str, bytes: &[u8], sig_path: Option<&str>, custom_sigs: Option<&[crate::flirt::CustomSig]>) -> Result<Program, String> {
     let obj = open_object(path, bytes)?;
     let text = code_section(&obj).ok_or(
         "the file has no executable section, so there is no code to decompile",
@@ -893,6 +893,30 @@ pub fn analyze_bytes(path: &str, bytes: &[u8]) -> Result<Program, String> {
                 f.name = lifter::sanitize_name(name);
             }
         }
+    }
+
+    if let Some(sig_path) = sig_path {
+        crate::flirt::match_signatures(&mut funcs, text_data, text_addr, sig_path);
+    }
+    
+    // Auto-apply default Windows MSVC signatures for PE files (x64)
+    if obj.format() == object::BinaryFormat::Pe {
+        crate::flirt::match_signature_bytes(
+            &mut funcs, text_data, text_addr, 
+            crate::default_sigs::LIBCMT_MSVC_X64, 
+            false, 
+            "default_libcmt_msvc_x64"
+        );
+        crate::flirt::match_signature_bytes(
+            &mut funcs, text_data, text_addr, 
+            crate::default_sigs::LIBVCRUNTIME_MSVC_X64, 
+            false, 
+            "default_libvcruntime_msvc_x64"
+        );
+    }
+    
+    if let Some(sigs) = custom_sigs {
+        crate::flirt::apply_custom_sigs(&mut funcs, text_data, text_addr, sigs);
     }
 
     let selected: Vec<&FuncRegion> = funcs.iter().collect();
@@ -1009,9 +1033,9 @@ pub fn references_to(prog: &Program, target: u64, name: &str) -> Vec<(String, u6
     out
 }
 
-pub fn analyze_file(path: &str) -> Result<Program, String> {
+pub fn analyze_file(path: &str, sig_path: Option<&str>, custom_sigs: Option<&[crate::flirt::CustomSig]>) -> Result<Program, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
-    analyze_bytes(path, &bytes)
+    analyze_bytes(path, &bytes, sig_path, custom_sigs)
 }
 
 pub fn slice_of<'a>(data: &'a [u8], base: u64, f: &FuncRegion) -> Option<&'a [u8]> {

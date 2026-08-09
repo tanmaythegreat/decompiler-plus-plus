@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 fltk = { version = "1.4", optional = true }
 iced-x86 = { version = "1.21", default-features = false, features = ["std","decoder","instr_info","nasm"] }
+lancelot-flirt = "0.10.0"
 object = "0.32"
 
 [[bin]]
