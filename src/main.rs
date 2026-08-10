@@ -20,6 +20,8 @@ use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::process::exit;
+use mini_decompiler::flirt::{auto_generate_libc_signatures, match_signatures};
 
 struct Options {
     path: String,
@@ -71,7 +73,7 @@ fn parse_args() -> Options {
             }
             "-h" | "--help" => {
                 usage(&args[0]);
-                std::process::exit(0);
+                exit(0);
             }
             s => positional.push(s.to_string()),
         }
@@ -79,7 +81,7 @@ fn parse_args() -> Options {
     }
     if positional.is_empty() {
         usage(&args[0]);
-        std::process::exit(1);
+        exit(1);
     }
     o.path = positional[0].clone();
     if let Some(n) = positional.get(1).and_then(|s| s.parse::<usize>().ok()) {
@@ -107,16 +109,16 @@ fn main() {
 
     let bytes = fs::read(&opts.path).unwrap_or_else(|e| {
         eprintln!("failed to read {}: {}", opts.path, e);
-        std::process::exit(1);
+        exit(1);
     });
-    let obj = mini_decompiler::analysis::open_object(&opts.path, &bytes).unwrap_or_else(|e| {
+    let obj = open_object(&opts.path, &bytes).unwrap_or_else(|e| {
         eprintln!("{}", e);
-        std::process::exit(1);
+        exit(1);
     });
 
-    let text = mini_decompiler::analysis::code_section(&obj).unwrap_or_else(|| {
+    let text = code_section(&obj).unwrap_or_else(|| {
         eprintln!("the file has no executable section, so there is no code to decompile");
-        std::process::exit(1);
+        exit(1);
     });
     let text_addr = text.address();
     let text_data = text.data().unwrap_or(&[]);
@@ -176,11 +178,11 @@ fn main() {
     }
 
     if let Some(sig_path) = &opts.flirt {
-        mini_decompiler::flirt::match_signatures(&mut funcs, text_data, text_addr, sig_path);
+        match_signatures(&mut funcs, text_data, text_addr, sig_path);
     }
     
     if opts.auto_libc {
-        match mini_decompiler::flirt::auto_generate_libc_signatures() {
+        match auto_generate_libc_signatures() {
             Ok(sigs) => {
                 let count = mini_decompiler::flirt::apply_custom_sigs(&mut funcs, text_data, text_addr, &sigs);
                 println!("Auto-libc: matched {} functions", count);
@@ -238,7 +240,7 @@ fn main() {
             print!("{}", text);
         } else if let Err(e) = fs::write(dest, text) {
             eprintln!("failed to write {}: {}", dest, e);
-            std::process::exit(1);
+            exit(1);
         }
         return;
     }

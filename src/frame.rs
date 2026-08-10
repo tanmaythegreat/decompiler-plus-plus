@@ -845,13 +845,25 @@ fn make_struct(st: &mut StructTable, fname: &str, layout: &BTreeMap<i64, BTreeSe
 }
 
 fn detect_rbp_frame(instrs: &[LiftedInsn]) -> bool {
-    let mut saw_push = false;
+    let mut saw_push_rbp = false;
     for ins in instrs.iter().take(8) {
-        let t = ins.asm_text.replace(' ', "");
-        if t.starts_with("pushrbp") {
-            saw_push = true;
-        } else if saw_push && t.starts_with("movrbp,rsp") {
-            return true;
+        for st in &ins.stmts {
+            match st {
+                // the store half of `push rbp`: *[rsp+0] = rbp
+                Stmt::Assign { dst: Expr::Mem(mo), src: Expr::Reg(r) }
+                if r.full == "rbp"
+                    && mo.disp == 0
+                    && mo.base.as_ref().map_or(false, |b| b.full == "rsp") =>
+                    {
+                        saw_push_rbp = true;
+                    }
+                Stmt::Assign { dst: Expr::Reg(d), src: Expr::Reg(s) }
+                if saw_push_rbp && d.full == "rbp" && s.full == "rsp" =>
+                    {
+                        return true;
+                    }
+                _ => {}
+            }
         }
     }
     false

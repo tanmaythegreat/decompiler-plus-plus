@@ -11,6 +11,7 @@ use crate::simplify::KnownFns;
 use crate::{cgen, idiom, json, lifter, ptr, simplify};
 use object::{Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationTarget, SymbolKind};
 use std::collections::{HashMap, HashSet};
+use simplify::strip_frame;
 
 pub struct FuncRegion {
     pub name: String,
@@ -375,7 +376,7 @@ pub fn analyze(
 
     let mut frame = Frame::build(&insns, globals.clone(), structs, name);
     frame.rewrite(&mut insns, structs);
-    simplify::strip_frame(&mut insns);
+    strip_frame(&mut insns);
     frame.recover_register_params(&insns);
 
     let ret_width = detect_return(&insns, name);
