@@ -29,12 +29,21 @@ struct Options {
     only: Option<String>,
     flirt: Option<String>,
     auto_libc: bool,
+    ai_rename: bool,
 }
 
 fn parse_args() -> Options {
     let args: Vec<String> = env::args().collect();
-    let mut o =
-        Options { path: String::new(), max_funcs: 16, show_asm: false, only: None, json_out: None, flirt: None, auto_libc: false };
+    let mut o = Options {
+        path: String::new(),
+        max_funcs: 16,
+        show_asm: false,
+        only: None,
+        json_out: None,
+        flirt: None,
+        auto_libc: false,
+        ai_rename: false,
+    };
     let mut positional = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -55,6 +64,7 @@ fn parse_args() -> Options {
                 o.flirt = args.get(i).cloned();
             }
             "--auto-libc" => o.auto_libc = true,
+            "--ai-rename" => o.ai_rename = true,
             "-n" => {
                 i += 1;
                 o.max_funcs = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(16);
@@ -85,6 +95,9 @@ fn usage(prog: &str) {
     eprintln!("  -f, --func NAME   decompile just this function");
     eprintln!("  -n N              limit to N functions (default 16)");
     eprintln!("  -j, --json FILE   write the analysis as JSON for the viewer (- for stdout)");
+    eprintln!("  --auto-libc       generate libc/libgcc FLIRT signatures from the local toolchain");
+    eprintln!("  --ai-rename       ask the configured AI provider to name sub_XXXXXX functions and their a<N>/v<N> locals");
+    eprintln!("                    (Stage 3 fallback; needs an API key + provider, see File > AI Settings in the GUI or src/ai.rs)");
 }
 
 /// PLT stub address -> imported symbol name. Unchanged in spirit from the
@@ -244,8 +257,71 @@ fn main() {
         print!("{}", structs.render());
     }
 
-    for a in &results {
-        println!("{}", render(a, &structs, opts.show_asm));
+    let rendered: Vec<String> = results.iter().map(|a| render(a, &structs, opts.show_asm)).collect();
+
+    if opts.ai_rename {
+        print_ai_renamed(&results, &rendered);
+    } else {
+        for text in &rendered {
+            println!("{}", text);
+        }
+    }
+}
+
+/// Runs the Stage-3 AI naming pass (see `rename.rs`) over every function in
+/// `results` that still has its deterministic `sub_XXXXXX` name, then
+/// prints `rendered` with those names and their locals substituted in.
+/// Falls back to printing the unrenamed output — with a stderr note —
+/// rather than failing the whole run if the API key isn't set or a
+/// request errors out.
+fn print_ai_renamed(results: &[Analyzed], rendered: &[String]) {
+    use mini_decompiler::ai::AiClient;
+    use mini_decompiler::rename;
+
+    let client = match AiClient::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("--ai-rename: {e}; printing without AI-suggested names");
+            for text in rendered {
+                println!("{}", text);
+            }
+            return;
+        }
+    };
+
+    let by_name: HashMap<&str, &String> =
+        results.iter().map(|a| a.name.as_str()).zip(rendered.iter()).collect();
+
+    let targets: Vec<rename::AiTarget> = results
+        .iter()
+        .filter(|a| rename::needs_naming(a))
+        .map(|a| {
+            let code = by_name.get(a.name.as_str()).map(|s| (*s).clone()).unwrap_or_default();
+            rename::make_target(a, code)
+        })
+        .collect();
+    let total = targets.len();
+    if total == 0 {
+        for text in rendered {
+            println!("{}", text);
+        }
+        return;
+    }
+    eprintln!("--ai-rename: asking {} to name {} unresolved function(s)...", client.provider().display_name(), total);
+
+    let plan = rename::build_plan(
+        &client,
+        &targets,
+        |_, _, _| {},
+        |t, index, total, res| match res {
+            Ok(_) => eprintln!("  [{index}/{total}] {} named", t.name),
+            Err(e) => eprintln!("  [{index}/{total}] {}: skipped ({e})", t.name),
+        },
+    );
+
+    for a in results {
+        let text = by_name.get(a.name.as_str()).map(|s| s.as_str()).unwrap_or("");
+        println!("{}", rename::apply_plan(&a.name, text, &plan));
     }
 }
 

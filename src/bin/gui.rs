@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use mini_decompiler::cfg::Cfg;
 use mini_decompiler::emu::{Emu, SHOWN_REGS};
 use mini_decompiler::ir::{Field, StructDef, StructTable, Type};
+use mini_decompiler::rename;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -66,6 +67,14 @@ struct Ui {
     history_idx: usize,
     /// when true, library/FLIRT-matched functions are hidden from the function list
     hide_lib_fns: bool,
+    /// address of the function the AI naming pass is currently asking about,
+    /// if any — used to highlight that row in the function list while its
+    /// request is in flight.
+    ai_active_addr: Option<u64>,
+    /// function name -> (variable name -> index), snapshotted when an AI
+    /// naming pass starts so incoming renames can be applied without
+    /// re-borrowing `prog` for every message off the channel.
+    ai_var_index: HashMap<String, HashMap<String, usize>>,
 }
 
 impl Ui {
@@ -95,6 +104,8 @@ impl Ui {
             history: Vec::new(),
             history_idx: 0,
             hide_lib_fns: false,
+            ai_active_addr: None,
+            ai_var_index: HashMap::new(),
         }
     }
 
@@ -318,6 +329,9 @@ fn main() {
     app::set_menu_linespacing(6);
 
     let ui = Rc::new(RefCell::new(Ui::new()));
+    // Delivers progress from the background AI-renaming thread (see
+    // `run_ai_renaming`) back to this thread's event loop, below.
+    let (ai_tx, ai_rx) = app::channel::<AiEvent>();
 
     let mut win = window::Window::default().with_size(1620, 1000).with_label("decompiler++");
     win.set_color(BG);
@@ -693,11 +707,20 @@ fn main() {
                         }
                         if name == "_start" {
                             fn_list.add(&format!("@B@C4@{}\t{:x}", name, f.addr));
+                        } else if u.ai_active_addr == Some(f.addr) {
+                            // Currently being asked about by the AI naming
+                            // pass — italic + accent-colored so it's easy
+                            // to spot scrolling past as the pass works
+                            // through the list.
+                            fn_list.add(&format!("@i@C4@» {}\t{:x}", name, f.addr));
                         } else {
                             fn_list.add(&format!("{}\t{:x}", name, f.addr));
                         }
                         if i == u.cur {
                             fn_list.select(fn_list.size());
+                        }
+                        if u.ai_active_addr == Some(f.addr) {
+                            fn_list.middle_line(fn_list.size());
                         }
                     }
                 }
@@ -709,6 +732,7 @@ fn main() {
     let open_file: Rc<dyn Fn(Option<String>)> = {
         let ui = ui.clone();
         let reload = reload.clone();
+        let ai_tx = ai_tx.clone();
         Rc::new(move |path: Option<String>| {
             let path = match path {
                 Some(p) => p,
@@ -723,22 +747,69 @@ fn main() {
                     f.to_string_lossy().to_string()
                 }
             };
-            match analysis::analyze_file(&path, None, None) {
-                Ok(p) => {
-                    let mut u = ui.borrow_mut();
-                    u.cur = p.funcs.iter().position(|f| f.name == "main").unwrap_or(0);
-                    u.prog = Some(p);
-                    u.sel_addr = None;
-                    u.sel_var = None;
-                    u.emu = None;
-                    u.node_pos.clear();
+
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    dialog::alert_default(&format!("failed to read {}: {}", path, e));
+                    return;
                 }
+            };
+
+            // Stripped or statically-linked binaries are exactly the case
+            // where a plain symbol table won't have named much of anything.
+            // Ask whether it's worth the extra time on FLIRT and/or AI
+            // naming before running the (slower) full analysis.
+            let (use_flirt, use_ai) = match analysis::probe_binary(&path, &bytes) {
+                Ok(profile) if profile.stripped || profile.static_linked => {
+                    ask_rename_options(&path, &profile)
+                }
+                _ => (false, false),
+            };
+
+            let custom_sigs = if use_flirt {
+                match mini_decompiler::flirt::auto_generate_libc_signatures() {
+                    Ok(sigs) => Some(sigs),
+                    Err(e) => {
+                        dialog::alert_default(&format!(
+                            "FLIRT auto-signature generation failed: {}\n\nContinuing without it.",
+                            e
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let prog = match analysis::analyze_bytes(&path, &bytes, None, custom_sigs.as_deref()) {
+                Ok(p) => p,
                 Err(e) => {
                     dialog::alert_default(&format!("{}\n\nOnly ELF objects are supported.", e));
                     return;
                 }
+            };
+
+            {
+                let mut u = ui.borrow_mut();
+                u.cur = prog.funcs.iter().position(|f| f.name == "main").unwrap_or(0);
+                u.prog = Some(prog);
+                u.sel_addr = None;
+                u.sel_var = None;
+                u.emu = None;
+                u.node_pos.clear();
+                u.ai_active_addr = None;
             }
+
+            // Show the function list — with its plain deterministic names —
+            // right away, instead of leaving the GUI blank while AI naming
+            // runs. AI renaming (if requested) is kicked off after, and
+            // streams names in live as they arrive; see `run_ai_renaming`.
             reload();
+
+            if use_ai {
+                run_ai_renaming(&ui, ai_tx.clone());
+            }
         })
     };
 
@@ -997,6 +1068,28 @@ fn main() {
             },
         );
     }
+    {
+        let ui = ui.clone();
+        let ai_tx = ai_tx.clone();
+        menubar.add(
+            "&File/&AI-Assisted Renaming…\t",
+            Shortcut::None,
+            menu::MenuFlag::Normal,
+            move |_| {
+                if ui.borrow().prog.is_none() {
+                    dialog::alert_default("Please open a binary first.");
+                    return;
+                }
+                run_ai_renaming(&ui, ai_tx.clone());
+            },
+        );
+    }
+    menubar.add(
+        "&File/&AI Settings…\t",
+        Shortcut::None,
+        menu::MenuFlag::Normal,
+        move |_| show_api_key_dialog(),
+    );
     menubar.add("&File/&Quit\t", Shortcut::Ctrl | 'q', menu::MenuFlag::Normal, |_| app::quit());
     {
         let ui = ui.clone();
@@ -1402,11 +1495,394 @@ fn main() {
         }
     }
 
-    app.run().unwrap();
+    // Standard fltk-rs pattern for draining a background thread's messages:
+    // `app::wait()` blocks until there's something to do — including a
+    // background thread calling `Sender::send`, which wakes it via
+    // `app::awake()` — so this isn't a busy loop.
+    let mut status_loop = status.clone();
+    while app.wait() {
+        if let Some(ev) = ai_rx.recv() {
+            handle_ai_event(ev, &ui, &mut status_loop, &reload);
+        }
+    }
 }
 
 fn short(p: &str) -> String {
     p.rsplit('/').next().unwrap_or(p).to_string()
+}
+
+/// Modal "how should we handle this binary" prompt, shown right after
+/// opening a binary that `analysis::probe_binary` flagged as stripped or
+/// statically linked — the two cases where a plain symbol table won't have
+/// named much of anything. Returns (use_flirt, use_ai); clicking Skip or
+/// closing the window is the same as leaving both boxes unchecked, since
+/// either way it means "just do the normal, symbol-table-only analysis".
+fn ask_rename_options(filename: &str, profile: &analysis::BinaryProfile) -> (bool, bool) {
+    let kind = match (profile.stripped, profile.static_linked) {
+        (true, true) => "stripped and statically linked",
+        (true, false) => "stripped",
+        (false, true) => "statically linked",
+        (false, false) => "",
+    };
+
+    let mut w = window::Window::default().with_size(440, 234).with_label("Name recovery");
+    w.set_color(PANEL);
+
+    let mut head = frame::Frame::new(16, 14, 408, 44, None);
+    head.set_label(&format!(
+        "{} looks {}.\nFunction names may be missing — recover some before analysing?",
+        short(filename),
+        kind
+    ));
+    head.set_label_color(FG);
+    head.set_label_size(12);
+    head.set_align(Align::Inside | Align::Left | Align::Wrap);
+
+    let mut flirt_cb = button::CheckButton::new(
+        16,
+        66,
+        408,
+        22,
+        "Use FLIRT signatures (identify statically-linked library functions)",
+    );
+    flirt_cb.set_value(true);
+    flirt_cb.set_label_color(FG);
+    flirt_cb.set_label_size(12);
+    flirt_cb.set_color(PANEL);
+    flirt_cb.set_selection_color(ACCENT);
+    flirt_cb.set_frame(FrameType::FlatBox);
+
+    let mut ai_cb = button::CheckButton::new(
+        16,
+        92,
+        408,
+        22,
+        "Use AI renaming (see File > AI Settings…)",
+    );
+    ai_cb.set_value(false);
+    ai_cb.set_label_color(FG);
+    ai_cb.set_label_size(12);
+    ai_cb.set_color(PANEL);
+    ai_cb.set_selection_color(ACCENT);
+    ai_cb.set_frame(FrameType::FlatBox);
+
+    let mut note = frame::Frame::new(16, 120, 408, 50, None);
+    note.set_label(
+        "FLIRT runs first and is local/instant. AI renaming only\n\
+         targets functions still unnamed afterwards, and sends\n\
+         their decompiled C to Model Studio.",
+    );
+    note.set_label_color(DIM);
+    note.set_label_size(11);
+    note.set_align(Align::Inside | Align::Left | Align::Wrap);
+
+    let mut skip_btn = button::Button::new(228, 186, 90, 30, "Skip");
+    skip_btn.set_color(PANEL2);
+    skip_btn.set_label_color(FG);
+    skip_btn.set_frame(FrameType::FlatBox);
+
+    let mut ok_btn = button::Button::new(326, 186, 98, 30, "Analyse");
+    ok_btn.set_color(PANEL2);
+    ok_btn.set_label_color(FG);
+    ok_btn.set_frame(FrameType::FlatBox);
+
+    w.end();
+    w.make_modal(true);
+    w.show();
+
+    let result: Rc<RefCell<(bool, bool)>> = Rc::new(RefCell::new((false, false)));
+
+    {
+        let mut w2 = w.clone();
+        skip_btn.set_callback(move |_| w2.hide());
+    }
+    {
+        let result = result.clone();
+        let mut w2 = w.clone();
+        let flirt_cb = flirt_cb.clone();
+        let ai_cb = ai_cb.clone();
+        ok_btn.set_callback(move |_| {
+            *result.borrow_mut() = (flirt_cb.value(), ai_cb.value());
+            w2.hide();
+        });
+    }
+    w.set_callback(move |w| w.hide());
+
+    while w.shown() {
+        app::wait();
+    }
+
+    let picked = *result.borrow();
+    picked
+}
+
+/// Lets the user pick an AI provider (OpenAI/ChatGPT, Anthropic/Claude,
+/// Google/Gemini, Alibaba/Qwen, or a custom OpenAI-compatible endpoint),
+/// then paste in that provider's API key (masked) and optionally override
+/// its model. Everything is saved to `~/.config/dpp-gui/config.toml` via
+/// `mini_decompiler::config`. Saved values are only ever used as a
+/// fallback when the matching provider-specific env var (e.g.
+/// OPENAI_API_KEY) isn't already set — see `AiClient::from_env`.
+fn show_api_key_dialog() {
+    use mini_decompiler::ai::Provider;
+
+    let current = Provider::active();
+    let options: Vec<String> =
+        Provider::ALL.iter().map(|p| format!("{} ({})", p.key(), p.display_name())).collect();
+    let provider_prompt = format!(
+        "Which AI provider? Type one of: {}\n(current default: {})",
+        Provider::ALL.iter().map(|p| p.key()).collect::<Vec<_>>().join(", "),
+        current.key()
+    );
+    let Some(picked) = dialog::input_default(&provider_prompt, current.key()) else { return };
+    let Some(provider) = Provider::parse(&picked) else {
+        dialog::alert_default(&format!(
+            "\"{}\" isn't a provider I recognise. Choose one of: {}",
+            picked.trim(),
+            options.join(", ")
+        ));
+        return;
+    };
+
+    if let Err(e) = mini_decompiler::config::save_active_provider(provider.key()) {
+        dialog::alert_default(&format!("Failed to save active provider: {e}"));
+        return;
+    }
+
+    let env_var = match provider {
+        Provider::OpenAI => "OPENAI_API_KEY",
+        Provider::Anthropic => "ANTHROPIC_API_KEY",
+        Provider::Gemini => "GEMINI_API_KEY",
+        Provider::Qwen => "DASHSCOPE_API_KEY",
+        Provider::Custom => "CUSTOM_API_KEY",
+    };
+    let existing_key = mini_decompiler::config::load_api_key(provider.key());
+    let key_prompt = if std::env::var(env_var).is_ok() {
+        format!(
+            "{env_var} is currently set in your environment and will be\n\
+             used instead of any key saved here. Enter a key anyway to\n\
+             save it as a fallback for when the env var isn't set:"
+        )
+    } else if existing_key.is_some() {
+        format!(
+            "Enter a new {} API key to replace the one currently saved\n\
+             (leave blank and press OK, then Remove, to clear it):",
+            provider.display_name()
+        )
+    } else {
+        format!("Enter your {} API key:", provider.display_name())
+    };
+
+    let Some(input) = dialog::password_default(&key_prompt, "") else { return };
+    let key = input.trim().to_string();
+
+    if key.is_empty() {
+        if existing_key.is_some()
+            && dialog::choice2_default("No key entered. Remove the saved key?", "Cancel", "Remove", "")
+                == Some(1)
+        {
+            match mini_decompiler::config::clear_api_key(provider.key()) {
+                Ok(()) => dialog::message_default("Saved API key removed."),
+                Err(e) => dialog::alert_default(&format!("Failed to remove key: {e}")),
+            }
+        }
+    } else if let Err(e) = mini_decompiler::config::save_api_key(provider.key(), &key) {
+        dialog::alert_default(&format!("Failed to save key: {e}"));
+        return;
+    }
+
+    // Optional model override — most people can skip this and get the
+    // built-in default (see `Provider::default_model`), but "custom"
+    // endpoints and anyone chasing a newer model need it.
+    let existing_model = mini_decompiler::config::load_model(provider.key()).unwrap_or_default();
+    let model_prompt = format!(
+        "Model override for {} (leave blank to use the default):",
+        provider.display_name()
+    );
+    if let Some(model_input) = dialog::input_default(&model_prompt, &existing_model) {
+        if let Err(e) = mini_decompiler::config::save_model(provider.key(), model_input.trim()) {
+            dialog::alert_default(&format!("Failed to save model: {e}"));
+            return;
+        }
+    }
+
+    // "custom" also needs a base URL, since there's no sensible built-in
+    // default for an arbitrary OpenAI-compatible endpoint.
+    if provider == Provider::Custom {
+        let existing_url = mini_decompiler::config::load_base_url(provider.key()).unwrap_or_default();
+        if let Some(url_input) = dialog::input_default(
+            "Base URL for the custom OpenAI-compatible endpoint\n(e.g. http://localhost:11434/v1):",
+            &existing_url,
+        ) {
+            if let Err(e) = mini_decompiler::config::save_base_url(provider.key(), url_input.trim()) {
+                dialog::alert_default(&format!("Failed to save base URL: {e}"));
+                return;
+            }
+        }
+    }
+
+    dialog::message_default(&format!(
+        "Saved to {}\n\nAI renaming will use {} whenever its API key\nisn't already set via {env_var}.",
+        mini_decompiler::config::config_file_display(),
+        provider.display_name(),
+    ));
+}
+
+/// Progress messages from the background AI-renaming thread (see
+/// `run_ai_renaming`) back to the GUI thread, delivered through an
+/// `app::channel`. Kept to plain owned data (`String`/`u64`/`HashMap`) so
+/// it's `Send + Sync` with no extra work.
+enum AiEvent {
+    /// About to ask the model about this function — `index`/`total` are
+    /// 1-based progress for the status line.
+    Started { addr: u64, name: String, index: usize, total: usize },
+    /// The model answered (or the request failed) for one function.
+    /// `new_name`/`vars` are already validated and deduped — see
+    /// `rename::RenamePlan::accept` — so they can be applied as-is.
+    Result {
+        old_name: String,
+        addr: u64,
+        new_name: Option<String>,
+        vars: HashMap<String, String>,
+        error: Option<String>,
+        index: usize,
+        total: usize,
+    },
+    /// The whole pass is done.
+    Finished { total: usize },
+}
+
+/// Kicks off the Stage-3 AI naming pass (see `rename.rs`) over every
+/// function in the current program that still has its deterministic
+/// `sub_XXXXXX` name. Unlike the earlier synchronous version, this returns
+/// immediately: the actual network round-trips run on a background thread,
+/// which streams an `AiEvent` per function back through `ai_tx` as it goes.
+/// The GUI thread's `app::wait()` loop (see `main`) applies each one to the
+/// UI's rename maps and calls `reload()` — the same maps manual F2 renaming
+/// writes to, so a bad AI guess is exactly as harmless, and as undoable, as
+/// a bad manual rename — as soon as it arrives, instead of waiting for the
+/// whole pass to finish. This is also why opening a file no longer blocks
+/// on AI renaming: the caller populates the function list with its
+/// deterministic names first, then calls this, and names update live as
+/// replies come back.
+fn run_ai_renaming(ui: &Rc<RefCell<Ui>>, ai_tx: app::Sender<AiEvent>) {
+    let client = match mini_decompiler::ai::AiClient::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            dialog::alert_default(&format!("AI renaming skipped: {}", e));
+            return;
+        }
+    };
+
+    // Everything the background thread needs is pulled out as plain owned
+    // data right here, while we still hold the borrow — `Analyzed` itself
+    // stays behind the GUI's `RefCell` and never crosses the thread
+    // boundary. This is also where the var-name index gets snapshotted for
+    // later, since it stays valid for the life of this pass (the analysis
+    // itself never changes, only which display names are attached to it).
+    let targets = {
+        let mut u = ui.borrow_mut();
+        let Some(prog) = &u.prog else { return };
+        let structs = prog.structs.clone();
+        let targets: Vec<rename::AiTarget> = prog
+            .funcs
+            .iter()
+            .filter(|a| rename::needs_naming(a))
+            .map(|a| rename::make_target(a, analysis::render(a, &structs, false)))
+            .collect();
+        u.ai_var_index = prog
+            .funcs
+            .iter()
+            .map(|f| {
+                let vars =
+                    f.frame.vars.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
+                (f.name.clone(), vars)
+            })
+            .collect();
+        targets
+    };
+
+    let total = targets.len();
+    if total == 0 {
+        dialog::message_default("Every function already has a name — nothing for AI renaming to do.");
+        return;
+    }
+
+    std::thread::spawn(move || {
+        rename::build_plan(
+            &client,
+            &targets,
+            |t, index, total| {
+                ai_tx.send(AiEvent::Started { addr: t.addr, name: t.name.clone(), index, total });
+            },
+            |t, index, total, res| {
+                let (new_name, vars, error) = match res {
+                    Ok((new_name, vars)) => (new_name, vars, None),
+                    Err(e) => (None, HashMap::new(), Some(e.to_string())),
+                };
+                ai_tx.send(AiEvent::Result {
+                    old_name: t.name.clone(),
+                    addr: t.addr,
+                    new_name,
+                    vars,
+                    error,
+                    index,
+                    total,
+                });
+            },
+        );
+        ai_tx.send(AiEvent::Finished { total });
+    });
+}
+
+/// Applies one `AiEvent` to the UI state and status line, then reloads the
+/// function list so a rename (or the in-progress highlight) shows up
+/// immediately. Called from the `app::wait()` loop in `main` as messages
+/// arrive off the AI-renaming background thread.
+fn handle_ai_event(
+    ev: AiEvent,
+    ui: &Rc<RefCell<Ui>>,
+    status: &mut frame::Frame,
+    reload: &Rc<dyn Fn()>,
+) {
+    match ev {
+        AiEvent::Started { addr, name, index, total } => {
+            ui.borrow_mut().ai_active_addr = Some(addr);
+            // reload() (via redraw()) sets its own default status text, so
+            // the progress message has to go on *after* it or it's
+            // overwritten instantly.
+            reload();
+            status.set_label(&format!("  AI renaming: {}/{} — {}", index, total, name));
+        }
+        AiEvent::Result { old_name, addr, new_name, vars, error, index, total } => {
+            {
+                let mut u = ui.borrow_mut();
+                if let Some(new) = &new_name {
+                    u.fn_names.insert(old_name.clone(), new.clone());
+                }
+                if let Some(idx) = u.ai_var_index.get(&old_name).cloned() {
+                    for (old_var, new_var) in &vars {
+                        if let Some(&i) = idx.get(old_var) {
+                            u.var_names.insert((old_name.clone(), i), new_var.clone());
+                        }
+                    }
+                }
+                if u.ai_active_addr == Some(addr) {
+                    u.ai_active_addr = None;
+                }
+            }
+            if let Some(err) = &error {
+                eprintln!("AI renaming: {} skipped ({err})", old_name);
+            }
+            reload();
+            status.set_label(&format!("  AI renaming: {}/{} done", index, total));
+        }
+        AiEvent::Finished { total } => {
+            ui.borrow_mut().ai_active_addr = None;
+            reload();
+            status.set_label(&format!("  AI renaming finished — {} function(s)", total));
+        }
+    }
 }
 
 fn define_struct(ui: &Rc<RefCell<Ui>>) {

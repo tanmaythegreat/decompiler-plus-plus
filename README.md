@@ -175,3 +175,80 @@ ELF, PE/COFF, and Mach-O are all read through the same loader — executables, s
 - No switch / jump-table recovery; an indirect jump ends the block.
 - Floating-point lifts but is barely typed — SSE registers print as `double` regardless of `ss`/`sd` form.
 - The viewer does not save renames or renamings to disk.
+
+---
+
+## AI-assisted naming (Stage 3, opt-in)
+
+For functions that survive every deterministic stage — no symbol, no FLIRT
+match, still sitting there as `sub_401660(a1, a2)` — `--ai-rename` sends the
+decompiled C to an AI provider and asks for better names.
+
+Five providers are supported, all through one client (`src/ai.rs`):
+
+| Provider | `AI_PROVIDER` value | API key env var | Default model |
+|---|---|---|---|
+| OpenAI (ChatGPT) | `openai` | `OPENAI_API_KEY` | `gpt-5-mini` |
+| Anthropic (Claude) | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
+| Google (Gemini) | `gemini` | `GEMINI_API_KEY` | `gemini-3.6-flash` |
+| Alibaba (Qwen / DashScope) | `qwen` | `DASHSCOPE_API_KEY` | `qwen3.8-max` |
+| Custom (any OpenAI-compatible endpoint) | `custom` | `CUSTOM_API_KEY` | *(must be set — see below)* |
+
+Provider lineups move fast — if a default model above gets deprecated or
+retired, set `OPENAI_MODEL`/`ANTHROPIC_MODEL`/`GEMINI_MODEL`/`QWEN_MODEL`
+(or the model field in **File > AI Settings…**) to whatever's current;
+there's no need to rebuild.
+
+Pick a provider with `AI_PROVIDER`, set its key, and run:
+
+```bash
+export AI_PROVIDER=openai
+export OPENAI_API_KEY=sk-...
+cargo run --release --bin mini_decompiler -- --ai-rename /path/to/binary
+```
+
+If `AI_PROVIDER` isn't set, the client falls back to whatever provider was
+last chosen in the GUI's **File > AI Settings…** dialog, then to `qwen` (the
+original default, kept for backwards compatibility with existing setups).
+
+Every provider also has a `*_MODEL` and `*_BASE_URL` override
+(`OPENAI_MODEL`, `OPENAI_BASE_URL`, `ANTHROPIC_MODEL`, ..., `CUSTOM_MODEL`,
+`CUSTOM_BASE_URL`) for pointing at a newer model or a self-hosted /
+alternative endpoint without a rebuild. `custom` has no built-in base URL or
+model — those two must come from the env vars or the Settings dialog, since
+"custom" only means anything with a user-supplied OpenAI-compatible
+endpoint (e.g. a local Ollama/vLLM server, Groq, DeepSeek, etc).
+
+In the GUI, **File > AI Settings…** lets you pick a provider, paste in its
+key (masked, saved to `~/.config/dpp-gui/config.toml`, chmod 600), and
+optionally override its model/base-URL — all without touching environment
+variables. A key saved this way is only ever used as a fallback for when
+the matching env var isn't already set, so scripted/CI usage is unaffected.
+Sanity-check any provider's connection with:
+
+```bash
+cargo run --bin ai_test -- "what CPU architecture is a Harvard architecture typically paired with?"
+```
+
+What `--ai-rename` does, precisely:
+
+- Only targets functions matching `sub_XXXXXX` that weren't already named by
+  FLIRT or the symbol table (`rename::needs_naming`); everything else is
+  left exactly as the deterministic pipeline produced it.
+- One request per eligible function, with the function's callee list
+  included as extra grounding. A failed or unparseable reply is skipped
+  (with a note on stderr) rather than aborting the run — one flaky call
+  doesn't cost every other function's names.
+- Every proposed identifier is validated (real C identifier, not a
+  keyword, not a no-op) and deduped against everything else already
+  accepted before it's used — function names program-wide (they're visible
+  from every call site), variable names within their own function.
+- Renaming is applied to the *rendered* C text, never baked back into the
+  analysis — the same approach the GUI's manual F2 rename already uses —
+  so a bad suggestion never corrupts anything the deterministic stages
+  produced.
+
+This is deliberately the tool's last resort, per the taxonomy this project
+is built from: deterministic sanitisation first, symbolic execution second,
+AI only for what's left. See `src/rename.rs` for the implementation and
+`src/ai.rs` for the underlying multi-provider client.
